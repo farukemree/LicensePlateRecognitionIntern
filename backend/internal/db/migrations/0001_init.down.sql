@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS webpush_subscription;
+DROP TABLE IF EXISTS notification;
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS anpr_correction;
+DROP TABLE IF EXISTS expected_arrival;
+DROP TABLE IF EXISTS blacklist;
+DROP TABLE IF EXISTS vehicle_log;
+DROP TABLE IF EXISTS user_depot_access;
+DROP TABLE IF EXISTS "user";
+DROP TABLE IF EXISTS driver;
+DROP TABLE IF EXISTS vehicle;
+DROP TABLE IF EXISTS depot;
