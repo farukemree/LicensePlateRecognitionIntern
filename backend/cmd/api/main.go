@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -29,6 +30,11 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		runHealthcheck()
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -116,5 +122,19 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("sunucu duzgun kapatilamadi: %v", err)
+	}
+}
+
+func runHealthcheck() {
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:8080/healthz")
+	if err != nil {
+		log.Printf("healthcheck basarisiz: %v", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("healthcheck beklenmeyen durum kodu: %d", resp.StatusCode)
+		os.Exit(1)
 	}
 }
