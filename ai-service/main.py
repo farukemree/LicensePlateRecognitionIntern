@@ -7,6 +7,7 @@ import time
 import os
 import re
 import json
+import base64
 import threading
 from urllib.parse import quote
 
@@ -28,7 +29,7 @@ from ultralytics import YOLO   # 👈 patch'ten SONRA import edilmeli
 import easyocr
 import torch.nn as nn
 
-app = FastAPI(title="Lojistik Plaka Tanıma AI Servisi", version="1.1")
+app = FastAPI(title="Lojistik Plaka Tanıma AI Servisi", version="1.2")
 
 # Yeniden eğitim için veri setinin birikeceği klasörü oluşturuyoruz
 RETRAIN_DIR = "/app/dataset/retrain"
@@ -63,13 +64,64 @@ if DEBUG_ORIJINAL_KARE_KAYDET:
     print(f"🐞 ORİJİNAL KARE TEŞHİS MODU AKTİF: Tam kareler (YOLO kutusu çizili) '{DEBUG_ORIJINAL_KARE_DIR}' klasörüne kaydedilecek.")
 
 print("🧠 YOLOv8 ve EasyOCR modelleri belleğe yükleniyor...")
-model = YOLO("license_plate_detector.pt")
+model = YOLO("license_plate_detector.pt")  # Plaka tespiti
+detection_model = YOLO("yolov8m.pt")       # Araç/İnsan tespiti (COCO dataset)
+
+# 🎯 --- TESPİT KALİTESİ AYARLARI ---
+# Bu değerleri .env üzerinden değiştirebilirsin, deploy gerekmez.
+# PLAKA_CONF_ESIGI: plaka dedektörünün confidence eşiği. Önceden HİÇ eşik
+# yoktu (Ultralytics varsayılanı 0.25 kullanılıyordu) — bu da düşük güvenli/
+# gürültülü kutuların (yanlış pozitiflerin) OCR'a kadar sızmasına izin
+# veriyordu. 0.4 civarı, çoğu senaryoda iyi bir denge noktasıdır.
+PLAKA_CONF_ESIGI = float(os.getenv("PLAKA_CONF_ESIGI", "0.4"))
+# PLAKA_IMGSZ: YOLO'nun inference çözünürlüğü. Varsayılan 640 küçük/uzak
+# plakalarda karakterleri kaybettirebiliyor. 1280 yapmak, biraz daha yavaş
+# ama gözle görülür şekilde daha isabetli tespit sağlar.
+PLAKA_IMGSZ = int(os.getenv("PLAKA_IMGSZ", "1280"))
+
+# 🚗 COCO Veri Seti Sınıfları
+COCO_CLASSES = {
+    0: "insan", 2: "araba", 3: "motosiklet", 5: "otobüs", 7: "kamyon",
+    15: "kedi", 16: "köpek"  # bonus
+}
 
 easyocr_cache_dir = os.getenv("EASYOCR_MODULE_DATA_DIR", "/app/.easyocr")
 gpu_kullanilabilir = torch.cuda.is_available()
 print(f"🖥️ GPU durumu: {'AKTİF ✅' if gpu_kullanilabilir else 'PASİF (CPU üzerinde çalışılıyor) ⚠️'}")
 reader = easyocr.Reader(['tr', 'en'], gpu=gpu_kullanilabilir, model_storage_directory=easyocr_cache_dir)
+# ⚠️ Not: 'detail' ve 'paragraph' Reader()'ın değil reader.readtext()'in
+# parametreleridir. Kod içindeki tüm readtext() çağrıları zaten varsayılan
+# detail=1, paragraph=False ile çağrılıyor — bu da (bbox, text, prob)
+# üçlüsünü döndürür ve parcalari_plaka_olarak_birlestir() fonksiyonunun
+# beklediği format tam olarak budur. paragraph=True verilirse readtext()
+# confidence değerini KALDIRIR ((bbox, text) döner) ve aşağıdaki tüm
+# unpacking mantığı kırılır — o yüzden bilerek eklemiyoruz.
 print("✅ Modeller başarıyla yüklendi, sistem tetikte!")
+
+# 📷 PLAKA OKUMASINI İYİLEŞTİREN PREPROCESSING FONKSİYONU
+def plaka_ocr_preprocessing(plaka_gorsel):
+    """Kırpılan plaka görseline contrast + sharpness ekle"""
+    import numpy as np
+    
+    # 1️⃣ Contrast Enhancement (CLAHE)
+    lab = cv2.cvtColor(plaka_gorsel, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.merge([l, a, b])
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+    
+    # 2️⃣ Resize (Daha büyük → OCR daha iyi)
+    h, w = enhanced.shape[:2]
+    if w < 400:
+        scale = 400 / w
+        enhanced = cv2.resize(enhanced, (int(w * scale), int(h * scale)), 
+                              interpolation=cv2.INTER_CUBIC)
+    
+    # 3️⃣ Bilateral Filter (Noise azalt, kenarlar koruyarak)
+    enhanced = cv2.bilateralFilter(enhanced, 9, 75, 75)
+    
+    return enhanced
 
 # --- 📋 VERİ YAPILARI ---
 class KameraIstek(BaseModel):
@@ -84,8 +136,11 @@ class PlakaVeriPaketi(BaseModel):
     depo_id: int
     yon: str            # "giris" veya "cikis" — .NET tarafının hangi kapıdan geçtiğini ayırt etmesi için
     plaka_metni: str
+    arac_tipi: str      # "araba", "kamyon", "otobüs" vb.
     guven_skoru: float
     tarih_saat: str
+    plaka_gorseli_base64: Optional[str] = None  # 🖼️ Okunan plakanın kırpılmış görseli (JPEG, base64)
+    tam_kare_gorseli_base64: Optional[str] = None  # 🖼️ Aracın tam kare görseli (YOLO kutusu ile), opsiyonel
 
 class PlakaDuzeltmeIstek(BaseModel):
     kamera_id: int      # Hangi kameranın görüntüsü düzeltilecek (giriş mi çıkış mı)
@@ -99,20 +154,29 @@ class PlakaDuzeltmeIstek(BaseModel):
 # (quote() bunu garantiye alıyor, elle yazılmış URL'lerdeki tutarsızlığı önler).
 _GEBZE_SIFRE_ENCODED = quote("center@dhl99", safe="")
 
+# 📡 RTSP PROFİL SEÇİMİ: IP kameralarda genelde profile1 = ana akış (yüksek
+# çözünürlük), profile2/profile3 = alt akış (düşük çözünürlük, önizleme/
+# mobil için tasarlanmıştır). Önceden profile2 kullanılıyordu — bu, plaka
+# karakterlerinin OCR için yetersiz piksel çözünürlüğüne düşmesine ve
+# "hiçbir varyantta metin okunamadı" hatalarına yol açan en olası sebepti.
+# RTSP_PROFIL ile .env üzerinden geri alınabilir (bant genişliği sorunu
+# yaşarsan "profile2" yaparak eski davranışa dönebilirsin).
+RTSP_PROFIL = os.getenv("RTSP_PROFIL", "profile1")
+
 GEBZE_KAMERALARI = [
     {
         "kamera_id": 1,
         "depo_id": 1,
         "yon": "giris",
         "isim": "Gebze Giriş Kamerası",
-        "rtsp_url": f"rtsp://admin:{_GEBZE_SIFRE_ENCODED}@2.200.168.165:8001/profile2/media.smp",
+        "rtsp_url": f"rtsp://admin:{_GEBZE_SIFRE_ENCODED}@2.200.168.165:8001/{RTSP_PROFIL}/media.smp",
     },
     {
         "kamera_id": 2,
         "depo_id": 1,
         "yon": "cikis",
         "isim": "Gebze Çıkış Kamerası",
-        "rtsp_url": f"rtsp://admin:{_GEBZE_SIFRE_ENCODED}@2.200.168.165:8003/profile2/media.smp",
+        "rtsp_url": f"rtsp://admin:{_GEBZE_SIFRE_ENCODED}@2.200.168.165:8003/{RTSP_PROFIL}/media.smp",
     },
 ]
 
@@ -342,6 +406,10 @@ def parcalari_plaka_olarak_birlestir(ocr_results):
     """
     parcalar = []
     for bbox, text, prob in ocr_results:
+        # 📊 Çok düşük güven parçaları hemen atla
+        if prob < 0.25:  # %25'ten az güven = çöp (False positive)
+            continue
+        
         temiz = plaka_temizle(text)
         if not temiz:
             continue
@@ -388,14 +456,64 @@ def parcalari_plaka_olarak_birlestir(ocr_results):
             problar.append(simdiki_parca["prob"])
             onceki_parca = simdiki_parca
 
-            if plaka_format_gecerli_mi(birlesik
+            if plaka_format_gecerli_mi(birlesik):
                 adaylar.append((birlesik, sum(problar) / len(problar)))
+                
+                # 🔄 ALTERNATIF PLAKALARI DENE: 1↔I, 0↔O vb. (OCR karıştırması çok yaygın)
+                for katiksiz, katikli in [("1", "I"), ("I", "1"), ("0", "O"), ("O", "0")]:
+                    alternatif = birlesik.replace(katiksiz, katikli)
+                    if alternatif != birlesik and plaka_format_gecerli_mi(alternatif):
+                        adaylar.append((alternatif, sum(problar) / len(problar) * 0.95))  # Düşük güven, alternattif olduğu için
 
     if not adaylar:
         return None, 0.0
 
     adaylar.sort(key=lambda x: x[1], reverse=True)
     return adaylar[0]
+
+
+def esnek_plaka_ara(ocr_results):
+    """
+    🩹 FALLBACK EŞLEŞTİRİCİ: parcalari_plaka_olarak_birlestir() KATI bir
+    zincirleme yapar — parçalar arasında y ekseninde uyumsuz TEK bir
+    gürültü/bozuk-okuma parçası bile (örn. "50" yerine "0506" gibi bozuk
+    okunmuş bir bölge) zinciri kırıp, aslında doğru okunmuş komşu
+    parçaların (örn. "AFM", "568") hiç birleştirilememesine yol açabiliyor.
+
+    Bu fonksiyon çok daha gevşek çalışır: TÜM parçaları (y ekseni kontrolü
+    YAPMADAN) x koordinatına göre sırayla yapıştırır, ortaya çıkan uzun
+    string içinde regex ile geçerli bir TR plaka alt-dizisi arar. Daha
+    toleranslı ama yanlış pozitif riski biraz daha yüksek olduğu için
+    SADECE birincil (katı) yöntem hiçbir sonuç veremediğinde, ikincil bir
+    kaynak olarak kullanılır — güveni de bilerek biraz düşürülür.
+    """
+    parcalar = []
+    for bbox, text, prob in ocr_results:
+        if prob < 0.20:
+            continue
+        temiz = plaka_temizle(text)
+        if not temiz or yasakli_metin_mi(temiz):
+            continue
+        x_min = min(nokta[0] for nokta in bbox)
+        parcalar.append((x_min, temiz, prob))
+
+    if not parcalar:
+        return None, 0.0
+
+    parcalar.sort(key=lambda p: p[0])
+    birlesik = "".join(p[1] for p in parcalar)
+    ortalama_guven = sum(p[2] for p in parcalar) / len(parcalar)
+
+    # Türk plakaları 7 ya da 8 karakter uzunluğunda (il kodu + harf + rakam)
+    for uzunluk in (8, 7):
+        for basla in range(0, max(0, len(birlesik) - uzunluk + 1)):
+            aday = birlesik[basla:basla + uzunluk]
+            if plaka_format_gecerli_mi(aday):
+                # Fallback olduğu için güveni %85'e çarpıyoruz — birincil
+                # yöntemden gelen bir adayla eşitse birincil yöntem kazansın.
+                return aday, ortalama_guven * 0.85
+
+    return None, 0.0
 
 
 def plakayi_izole_et(crop_bgr):
@@ -428,7 +546,7 @@ def plakayi_izole_et(crop_bgr):
 
     if en_iyi_kontur is not None:
         x, y, w, h = en_iyi_kontur
-        pad = 3
+        pad = 10  # 📐 Daha geniş padding (hareketi olan araçlar için)
         y1, y2 = max(0, y - pad), min(h_crop, y + h + pad)
         x1, x2 = max(0, x - pad), min(w_crop, x + w + pad)
         izole = crop_bgr[y1:y2, x1:x2]
@@ -470,6 +588,14 @@ def on_isleme_varyantlari(crop_bgr):
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     varyantlar.append(otsu)
 
+    # 4) Unsharp mask (keskinleştirme) + CLAHE — uzak/küçük plakalarda 3x
+    #    büyütme sırasında oluşan hafif bulanıklığı telafi etmeye çalışır.
+    #    Harflerin birbirine karışıp (örn. "AFM" yerine "AFY"/"TMG" gibi
+    #    tutarsız okumalara) yol açan durumları azaltması beklenir.
+    bulanik = cv2.GaussianBlur(clahe_gray, (0, 0), sigmaX=2.0)
+    keskin = cv2.addWeighted(clahe_gray, 1.6, bulanik, -0.6, 0)
+    varyantlar.append(keskin)
+
     return varyantlar
 
 
@@ -487,6 +613,9 @@ def kareyi_oku(best_crop):
     if w < 15 or h < 8:
         print(f"   ⚠️ [Teşhis] Kare çok küçük ({w}x{h}px) — OCR için yetersiz çözünürlük.")
 
+    # 📷 PREPROCESSING: Contrast artır, noise azalt, resize yap
+    best_crop = plaka_ocr_preprocessing(best_crop)
+    
     izole_edilmis = plakayi_izole_et(best_crop)
     varyantlar = on_isleme_varyantlari(izole_edilmis)
 
@@ -503,6 +632,16 @@ def kareyi_oku(best_crop):
             tum_ham_parcalar.append((v_idx, text, prob))
 
         plaka, ortalama_guven = parcalari_plaka_olarak_birlestir(ocr_results)
+
+        # 🩹 Katı zincirleme bu varyantta hiçbir aday üretemediyse, daha
+        # toleranslı fallback'i dene. Bu, "50" gibi bozuk okunan tek bir
+        # parça yüzünden aslında doğru okunmuş "AFM"+"568" gibi komşu
+        # parçaların çöpe gitmesini engelliyor.
+        if plaka is None:
+            plaka, ortalama_guven = esnek_plaka_ara(ocr_results)
+            if plaka is not None:
+                print(f"   🩹 [Esnek Eşleştirme] Katı zincirleme başarısız oldu ama fallback bir aday buldu: '{plaka}' (Güven: {ortalama_guven:.2f})")
+
         if plaka is not None and ortalama_guven > en_iyi_guven:
             en_iyi_plaka, en_iyi_guven = plaka, ortalama_guven
 
@@ -580,11 +719,31 @@ def kutu_ortusme_orani(kutu_a, kutu_b):
     return kesisim_alan / birlesim_alan
 
 
+def gorseli_base64_kodla(gorsel_bgr, jpeg_kalite: int = 85):
+    """
+    Bir OpenCV (BGR, numpy) görselini JPEG'e sıkıştırıp base64 string'e
+    çevirir. .NET API'sine gerçek görseli (sadece metadata değil) taşımak
+    için kullanılır. Encode başarısız olursa None döner (backend gönderimini
+    engellemesin diye exception fırlatmaz).
+    """
+    try:
+        basarili, buffer = cv2.imencode(".jpg", gorsel_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_kalite])
+        if not basarili:
+            return None
+        return base64.b64encode(buffer).decode("utf-8")
+    except Exception as e:
+        print(f"⚠️ Görsel base64'e çevrilemedi: {e}")
+        return None
+
+
 def send_plate_to_dotnet_sync(paket: PlakaVeriPaketi):
     """ Arka plan thread'lerinden .NET API'sine güvenli ve senkron veri yollayan webhook """
     try:
         print(f"🔗 [.NET POST] Gönderilen plaka: {paket.plaka_metni}")
-        response = requests.post(DOTNET_API_URL, json=paket.model_dump(), timeout=2.0)
+        # ⏱️ Timeout'u artırdık: base64 görsel gövdeye eklenince payload
+        # büyüyor (JPEG ~85 kalite + orta boy crop genelde birkaç yüz KB),
+        # 2 saniyelik eski limit yavaş ağlarda gereksiz timeout'lara yol açabilir.
+        response = requests.post(DOTNET_API_URL, json=paket.model_dump(), timeout=5.0)
         if response.status_code == 200:
             print(f"✅ .NET API veriyi aldı: Başarılı (200)")
         else:
@@ -614,6 +773,7 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
     arac_algilandi_mi = False
     arac_baslangic_zamani = 0.0
     son_tespit_zamani = 0.0   # bu episode'da aracın EN SON görüldüğü an
+    episode_arac_tipi = "bilinmiyor"  # 🚗 Bu episode'da tespit edilen araç tipi
     kare_havuzu = []
     episode_junk_kelimeleri = set()  # bu episode'da görülen, plaka olamayacak metin parçaları
 
@@ -627,7 +787,7 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
     # tetiklemiyor.
     ARAC_AYRILMA_BOSLUGU = 1.2     # saniye — bu kadar süre tespit gelmezse araç gerçekten ayrılmış sayılır
     MAKS_TOPLAMA_SANIYESI = 6.0    # saniye — güvenlik amaçlı azami toplama süresi
-    MIN_ISLEME_KARE_SAYISI = 3     # bundan az kare toplandıysa muhtemelen anlık yanlış algılamadır, OCR'a hiç sokma
+    MIN_ISLEME_KARE_SAYISI = 2     # 🎯 Hareket eden araçlar için düşürüldü (eski: 3)
 
     # 🧊 COOLDOWN: Aynı konumdaki (örn. arka planda park halinde duran) bir
     # nesnenin art arda tekrar tekrar yanlış okunmasını engellemek için
@@ -646,13 +806,72 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
             cap.open(rtsp_url)
             continue
 
+        # 🚫 Kameranın en üst %12'lik filigran/yazı alanını siyaha boya
+        # (kamera üstündeki "GEBZE GİRİŞ/ÇIKIŞ" yazısı, tarih/saat damgası
+        # gibi sabit metinler YOLO ve OCR'ı hiç yanıltmasın diye)
+        h_f, w_f = frame.shape[:2]
+        frame[0:int(h_f * 0.12), 0:w_f] = (0, 0, 0)
+
         simdi = time.time()
         if simdi - son_gonderim_zamani < 0.05:  # 20 FPS sınırlayıcı
             continue
         son_gonderim_zamani = simdi
 
         ai_device = 0 if torch.cuda.is_available() else "cpu"
-        results = model(frame, device=ai_device, verbose=False)
+        
+        # 🚗 ADIM 1: Önce araç/insan tespiti yap (filtreleme)
+        detection_results = detection_model(frame, device=ai_device, verbose=False, conf=0.5)
+        
+        # İnsan algılandıysa bu kareyi atla (plaka işleme yapma)
+        insan_bulundu = False
+        arac_tipi = "bilinmiyor"
+        arac_kutusu = None  # 🆕 plaka aramasını araç kutusuyla sınırlamak için
+
+        for det_result in detection_results:
+            det_boxes = det_result.boxes
+            for det_box in det_boxes:
+                class_id = int(det_box.cls[0])
+                
+                if class_id == 0:  # İnsan
+                    insan_bulundu = True
+                    break
+                
+                if class_id in COCO_CLASSES and class_id != 0:
+                    arac_tipi = COCO_CLASSES[class_id]
+                    axyxy = det_box.xyxy[0].cpu().numpy()
+                    arac_kutusu = tuple(map(int, axyxy))
+            
+            if insan_bulundu:
+                break
+        
+        # İnsan varsa bu kareyi işleme
+        if insan_bulundu:
+            continue
+        
+        # 🔍 ADIM 2: Şimdi plaka tespiti yap
+        # 🆕 İKİ AŞAMALI TESPİT: Eğer bir araç kutusu bulunduysa, plaka
+        # dedektörünü TÜM kareye değil, araç kutusuna (biraz paylı) kısıtlı
+        # bir bölgede çalıştırıyoruz. Bu sayede:
+        #  1) Plaka, bakılan alana oranla çok daha büyük olur -> OCR kalitesi artar
+        #  2) Arka plandaki sabit tabela/filigran gibi false-positive'ler
+        #     büyük ölçüde elenir (araç kutusunun dışında kalıyorlar)
+        # Araç kutusu yoksa (COCO tespiti bu karede başarısızsa) eskisi gibi
+        # tüm karede aramaya devam ediyoruz (fallback) — bu davranışı bozmuyoruz.
+        arama_karesi = frame
+        ofset_x, ofset_y = 0, 0
+        if arac_kutusu is not None:
+            ax1, ay1, ax2, ay2 = arac_kutusu
+            pay = int((ay2 - ay1) * 0.15)
+            ax1 = max(0, ax1 - pay)
+            ay1 = max(0, ay1 - pay)
+            ax2 = min(frame.shape[1], ax2 + pay)
+            ay2 = min(frame.shape[0], ay2 + pay)
+            if ax2 > ax1 and ay2 > ay1:
+                arama_karesi = frame[ay1:ay2, ax1:ax2]
+                ofset_x, ofset_y = ax1, ay1
+
+        results = model(arama_karesi, device=ai_device, verbose=False,
+                         conf=PLAKA_CONF_ESIGI, imgsz=PLAKA_IMGSZ)
 
         plaka_bulundu_bu_karede = False
         en_iyi_kutu = None
@@ -662,7 +881,11 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
             boxes = result.boxes
             for box in boxes:
                 xyxy = box.xyxy[0].cpu().numpy()
+                # 🆕 Aramayı araç kutusuna kısıtladıysak, koordinatları tekrar
+                # TAM KAREYE göre offsetliyoruz — sonrasındaki kırpma/kayıt
+                # işlemleri hep tam kare üzerinden yapıldığı için bu şart.
                 x1, y1, x2, y2 = map(int, xyxy)
+                x1, y1, x2, y2 = x1 + ofset_x, y1 + ofset_y, x2 + ofset_x, y2 + ofset_y
 
                 genislik = x2 - x1
                 yukseklik = y2 - y1
@@ -674,7 +897,14 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
                 plaka_bulundu_bu_karede = True
                 if alan > en_buyuk_alan:
                     en_buyuk_alan = alan
-                    en_iyi_kutu = (x1, y1, x2, y2)
+                    # 📐 YOLO bounding box'ını genişlet (padding = bounding box yüksekliğinin %20'si)
+                    bbox_yukseklik = y2 - y1
+                    padding = int(bbox_yukseklik * 0.2)
+                    x1_padded = max(0, x1 - padding)
+                    y1_padded = max(0, y1 - padding)
+                    x2_padded = min(frame.shape[1], x2 + padding)
+                    y2_padded = min(frame.shape[0], y2 + padding)
+                    en_iyi_kutu = (x1_padded, y1_padded, x2_padded, y2_padded)
 
         # 🚀 AKILLI TAMPON MANTIĞI
         if plaka_bulundu_bu_karede and en_iyi_kutu is not None:
@@ -697,7 +927,8 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
                     arac_baslangic_zamani = time.time()
                     kare_havuzu = []
                     episode_junk_kelimeleri = set()
-                    print("🚗 Araç algılandı. Kadrajda kaldığı sürece kare toplanıyor...")
+                    episode_arac_tipi = arac_tipi  # 🚗 Bu episode'daki araç tipini sakla
+                    print(f"🚗 Araç algılandı ({arac_tipi}). Kadrajda kaldığı sürece kare toplanıyor...")
 
                 # Her tespitte "son görülme zamanı"nı güncelliyoruz — bu,
                 # aracın HÂLÂ kadrajda olduğunun kanıtı. Aynı araç 2
@@ -705,13 +936,18 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
                 son_tespit_zamani = time.time()
                 episod_kutu = (x1, y1, x2, y2)
 
-                kare_havuzu.append({
-                    "gorsel": cropped_plate,
-                    "alan": en_buyuk_alan,
-                    "keskinlik": keskinlik_skoru(cropped_plate),
-                    "tam_kare": frame.copy() if DEBUG_ORIJINAL_KARE_KAYDET else None,
-                    "kutu": (x1, y1, x2, y2),
-                })
+                # 📸 Keskinlik filtresi: motion blur'lu kareleri atla
+                kare_keskinligi = keskinlik_skoru(cropped_plate)
+                if kare_keskinligi < 100:  # Çok bulanık → atla
+                    print(f"   🏃 [Blur Filtresi] Kare çok bulanık (keskinlik={kare_keskinligi:.1f}), atlandı.")
+                else:
+                    kare_havuzu.append({
+                        "gorsel": cropped_plate,
+                        "alan": en_buyuk_alan,
+                        "keskinlik": kare_keskinligi,
+                        "tam_kare": frame.copy() if DEBUG_ORIJINAL_KARE_KAYDET else None,
+                        "kutu": (x1, y1, x2, y2),
+                    })
 
                 # 🐞 Teşhis modu açıksa, YOLO'nun kırptığı HAM görüntüyü
                 # (hiçbir işleme sokmadan) diske kaydet
@@ -766,6 +1002,12 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
                     # Her kareden en iyi tekil adayı topluyoruz; sonra hepsini
                     # birlikte karakter-bazlı oylamaya (konsensüs) sokacağız
                     tum_adaylar = []
+                    # 🖼️ Backend'e gönderilecek "kanıt" görseli: en yüksek
+                    # skorlu (en net + en büyük) kırpılmış plaka karesi.
+                    # Bunu en başta, kare_havuzu sıralı haliyle sabitliyoruz;
+                    # OCR hangi kareden başarılı sonuç üretirse üretsin,
+                    # backend'e giden görsel hep episode'un en iyi karesidir.
+                    en_iyi_gonderim_goruntusu = kare_havuzu[0]["gorsel"] if kare_havuzu else None
 
                     for idx, best_crop in enumerate(en_iyi_kareler):
                         # Teşhis için son görsel referansını, bu KAMERAYA özel olarak güncelliyoruz
@@ -818,26 +1060,46 @@ def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: s
                             genel_en_iyi_plaka = duzeltilmis_plaka
                             genel_en_iyi_guven = max(genel_en_iyi_guven, 0.90)
 
-                    MIN_GUVEN_ESIGI = 0.40
+                    MIN_GUVEN_ESIGI = 0.35  # 📉 Biraz daha toleranslı (eski: 0.40)
 
                     if genel_en_iyi_plaka is None:
                         print("⚠️ Bu araç için hiçbir karede geçerli formatta plaka bulunamadı.")
                     elif genel_en_iyi_guven < MIN_GUVEN_ESIGI:
                         print(f"⚠️ En iyi aday '{genel_en_iyi_plaka}' düşük güven skoru yüzünden elendi ({genel_en_iyi_guven:.2f}).")
                     elif genel_en_iyi_plaka == son_okunan_plaka:
-                        print(f"⚠️ [Filtre] '{genel_en_iyi_plaka}' son okunan plaka ile aynı, tekrar gönderilmiyor.")
+                        print(f"⚠️ [Filtre] '{genel_en_iyi_plaka}' az önce gönderildi, tekrar gönderilmiyor.")
                     else:
                         son_okunan_plaka = genel_en_iyi_plaka
                         son_okunan_plaka_global = genel_en_iyi_plaka
                         print(f"🎯 [{yon.upper()}] Doğrulanmış Plaka Okundu! -> {genel_en_iyi_plaka} (Ort. Güven: {genel_en_iyi_guven:.2f})")
+
+                        # 🖼️ Kırpılmış plaka görselini (ve varsa kutu çizili tam
+                        # kareyi) base64'e çevirip pakete ekliyoruz — .NET
+                        # tarafı artık sadece metni değil, kanıt görselini de
+                        # kaydedebilir/gösterebilir.
+                        plaka_gorseli_b64 = None
+                        if en_iyi_gonderim_goruntusu is not None:
+                            plaka_gorseli_b64 = gorseli_base64_kodla(en_iyi_gonderim_goruntusu)
+
+                        tam_kare_b64 = None
+                        if DEBUG_ORIJINAL_KARE_KAYDET and kare_havuzu:
+                            en_iyi_ham_tam = kare_havuzu[0].get("tam_kare")
+                            if en_iyi_ham_tam is not None:
+                                bx1, by1, bx2, by2 = kare_havuzu[0]["kutu"]
+                                tam_kare_kopya2 = en_iyi_ham_tam.copy()
+                                cv2.rectangle(tam_kare_kopya2, (bx1, by1), (bx2, by2), (0, 255, 0), 3)
+                                tam_kare_b64 = gorseli_base64_kodla(tam_kare_kopya2)
 
                         veri_paketi = PlakaVeriPaketi(
                             kamera_id=kamera_id,
                             depo_id=depo_id,
                             yon=yon,
                             plaka_metni=genel_en_iyi_plaka,
+                            arac_tipi=episode_arac_tipi,  # 🚗 Araç tipi ekle
                             guven_skoru=float(genel_en_iyi_guven),
-                            tarih_saat=datetime.utcnow().isoformat()
+                            tarih_saat=datetime.utcnow().isoformat(),
+                            plaka_gorseli_base64=plaka_gorseli_b64,
+                            tam_kare_gorseli_base64=tam_kare_b64,
                         )
 
                         send_plate_to_dotnet_sync(veri_paketi)
