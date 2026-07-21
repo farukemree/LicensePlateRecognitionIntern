@@ -1,0 +1,52 @@
+services:
+  backend:
+    build: .
+    env_file: .env
+    ports:
+      # LAN icindeki cihazlarin erisebilmesi icin host'a acilir; disariya kapatma ufw ile yapilir.
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Not: disariya port acmaya gerek yok, backend zaten ayni Docker network'unden erisiyor.
+    # Elle baglanip kontrol etmek isterseniz asagidaki satiri actin:
+    # ports:
+    #   - "5432:5432"
+
+  # Redis su an opsiyonel/interface arkasinda (bkz. internal/cache). Ihtiyac duyulunca
+  # asagidaki servisi ve .env'deki REDIS_ENABLED=true ayarini acmaniz yeterli.
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   volumes:
+  #     - redis_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+volumes:
+  postgres_data:
+  # redis_data:
