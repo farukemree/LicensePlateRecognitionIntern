@@ -358,6 +358,39 @@ border-bottom:1px solid #ececec;
 
 }
 
+@media(max-width:900px){
+
+.admin-home-heading h2{
+font-size:30px;
+}
+
+.admin-home-heading p{
+max-width:none;
+}
+
+.admin-kpi-card,
+.admin-panel{
+padding:20px;
+}
+
+.admin-kpi-card strong{
+font-size:42px;
+}
+
+.admin-panel h3{
+font-size:20px;
+}
+
+.admin-summary-list li{
+padding:16px 18px;
+}
+
+.admin-summary-info strong{
+font-size:32px;
+}
+
+}
+
 @media(max-width:768px){
 
 .admin-home-heading{
