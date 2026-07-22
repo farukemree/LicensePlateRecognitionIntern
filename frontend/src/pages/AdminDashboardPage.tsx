@@ -1,10 +1,5 @@
 ﻿import { useState } from 'react'
 import type { ReactNode } from 'react'
-import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined'
-import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown'
-import NotificationsNoneOutlinedIcon from '@mui/icons-material/NotificationsNoneOutlined'
-import MenuOutlinedIcon from '@mui/icons-material/MenuOutlined'
-import LogoutOutlinedIcon from '@mui/icons-material/LogoutOutlined'
 import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined'
 import VideocamOutlinedIcon from '@mui/icons-material/VideocamOutlined'
 import LocalShippingOutlinedIcon from '@mui/icons-material/LocalShippingOutlined'
@@ -18,7 +13,7 @@ import Inventory2OutlinedIcon from '@mui/icons-material/Inventory2Outlined'
 import LoginOutlinedIcon from '@mui/icons-material/LoginOutlined'
 import LogoutIcon from '@mui/icons-material/Logout'
 import AccessTimeOutlinedIcon from '@mui/icons-material/AccessTimeOutlined'
-import dhlLogo from '../assets/dhl-logo.png'
+import DashboardLayout from '../components/layout/DashboardLayout'
 import SecurityPanelHome from '../components/security/SecurityPanelHome'
 import ExpectedVehiclesView from '../components/warehouse/expected/ExpectedVehiclesView'
 import BlacklistView from '../components/warehouse/blacklist/BlacklistView'
@@ -71,7 +66,6 @@ const users: User[] = []
 
 function AdminDashboardPage() {
   const [menuOpen, setMenuOpen] = useState(true)
-  const [profileOpen, setProfileOpen] = useState(false)
   const {
     expectedVehicles,
     activeBlacklistVehicles,
@@ -84,69 +78,17 @@ function AdminDashboardPage() {
   const currentUserName = 'Beyza Bora'
 
   return (
-    <main className="manager-page" aria-label="Admin ekranı">
-      <header className="manager-header">
-        <div className="manager-brand">
-          <img className="manager-logo" src={dhlLogo} alt="DHL" />
-          <h1>Plaka Tanıma Sistemi</h1>
-          <button
-            className="manager-menu-toggle"
-            type="button"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((current) => !current)}
-          >
-            <MenuOutlinedIcon />
-          </button>
-        </div>
-
-        <div className="manager-user-actions">
-          <button className="manager-icon-button" type="button">
-            <NotificationsNoneOutlinedIcon />
-          </button>
-
-          <div className="header-menu">
-            <button
-              className="manager-profile"
-              type="button"
-              aria-expanded={profileOpen}
-              onClick={() => setProfileOpen((current) => !current)}
-            >
-              <AccountCircleOutlinedIcon />
-              <span>{currentUserName}</span>
-              <KeyboardArrowDownIcon />
-            </button>
-
-            {profileOpen && (
-              <section className="profile-menu" aria-label="Profil Menüsü">
-                <strong>{currentUserName}</strong>
-                <span>Sistem Yöneticisi</span>
-                <button type="button">
-                  <LogoutOutlinedIcon />
-                  Çıkış Yap
-                </button>
-              </section>
-            )}
-          </div>
-        </div>
-      </header>
-
-      <div className={`manager-layout${menuOpen ? ' menu-open' : ''}`}>
-        {menuOpen && (
-          <aside className="manager-sidebar" aria-label="Admin Menüsü">
-            {adminMenuItems.map((item) => (
-              <button
-                key={item.label}
-                type="button"
-                className={item.label === activeSection ? 'active' : ''}
-                onClick={() => setActiveSection(item.label)}
-              >
-                <span>{item.icon}</span>
-                {item.label}
-              </button>
-            ))}
-          </aside>
-        )}
-
+    <DashboardLayout
+      activeSection={activeSection}
+      ariaLabel="Admin ekranı"
+      menuAriaLabel="Admin Menüsü"
+      menuItems={adminMenuItems}
+      menuOpen={menuOpen}
+      onMenuToggle={() => setMenuOpen((current) => !current)}
+      onSectionChange={setActiveSection}
+      roleLabel="Sistem Yöneticisi"
+      userName={currentUserName}
+    >
         <section className="manager-main">
           {activeSection === 'Ana Menü' && (
             <AdminHome
@@ -177,8 +119,7 @@ function AdminDashboardPage() {
             <UserManagementView users={users} />
           )}
         </section>
-      </div>
-    </main>
+    </DashboardLayout>
   )
 }
 
