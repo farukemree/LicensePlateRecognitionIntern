@@ -1,17 +1,13 @@
-﻿import { useState } from 'react'
+import { useState } from 'react'
 import type { ReactNode } from 'react'
-import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined'
-import LocalShippingOutlinedIcon from '@mui/icons-material/LocalShippingOutlined'
-import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined'
-import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown'
-import LogoutOutlinedIcon from '@mui/icons-material/LogoutOutlined'
-import MenuOutlinedIcon from '@mui/icons-material/MenuOutlined'
-import NotificationsNoneOutlinedIcon from '@mui/icons-material/NotificationsNoneOutlined'
-import dhlLogo from '../assets/dhl-logo.png'
 import BlockOutlinedIcon from '@mui/icons-material/BlockOutlined'
-import SecuritySectionPlaceholder from '../components/security/SecuritySectionPlaceholder'
+import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined'
+import LocalShippingOutlinedIcon from '@mui/icons-material/LocalShippingOutlined'
+import DashboardLayout from '../components/layout/DashboardLayout'
 import SecurityPanelHome from '../components/security/SecurityPanelHome'
+import SecuritySectionPlaceholder from '../components/security/SecuritySectionPlaceholder'
 import { useDashboardData } from '../lib/dashboardData'
+
 type SecuritySection = 'Ana Menü' | 'Beklenen Araçlar' | 'Kara Liste'
 
 type PlannedEntry = {
@@ -20,13 +16,14 @@ type PlannedEntry = {
   driver: string
   gate: string
 }
+
 type BlacklistVehicle = {
   plate: string
   reason: string
   addedAt: string
 }
-const blacklistVehicles: BlacklistVehicle[] = []
 
+const blacklistVehicles: BlacklistVehicle[] = []
 const plannedEntries: PlannedEntry[] = []
 
 const securityMenuItems: Array<{ icon: ReactNode; label: SecuritySection }> = [
@@ -36,109 +33,54 @@ const securityMenuItems: Array<{ icon: ReactNode; label: SecuritySection }> = [
 ]
 
 function SecurityDashboardPage() {
-  const [profileOpen, setProfileOpen] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const [activeSection, setActiveSection] = useState<SecuritySection>('Ana Menü')
   const { activeBlacklistVehicles, entryLogs, exitLogs } = useDashboardData()
   const currentUserName = 'Beyza Bora'
 
   return (
-    <main className="dashboard-page" aria-label="Plaka Tanıma Sistemi güvenlik ekranı">
-      <header className="manager-header">
-        <div className="manager-brand">
-          <img className="manager-logo" src={dhlLogo} alt="DHL" />
-          <h1>Plaka Tanıma Sistemi</h1>
-          <button
-            className="manager-menu-toggle"
-            type="button"
-            aria-label="Menüyü aç veya kapat"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((current) => !current)}
-          >
-            <MenuOutlinedIcon />
-          </button>
-        </div>
-
-        <div className="manager-user-actions">
-          <button className="manager-icon-button" type="button" aria-label="Bildirimler">
-            <NotificationsNoneOutlinedIcon />
-          </button>
-          <div className="header-menu">
-            <button
-              className="manager-profile"
-              type="button"
-              aria-expanded={profileOpen}
-              onClick={() => setProfileOpen((current) => !current)}
-            >
-              <AccountCircleOutlinedIcon />
-              <span>{currentUserName}</span>
-              <KeyboardArrowDownIcon />
-            </button>
-
-            {profileOpen && (
-              <section className="profile-menu" aria-label="Profil ayarları">
-                <strong>{currentUserName}</strong>
-                <span>Güvenlik Personeli</span>
-                <button type="button">
-                  <LogoutOutlinedIcon />
-                  Çıkış Yap
-                </button>
-              </section>
-            )}
-          </div>
-        </div>
-      </header>
-
-      <div className={`manager-layout${menuOpen ? ' menu-open' : ''}`}>
-        {menuOpen && (
-          <aside className="manager-sidebar" aria-label="Güvenlik görevlisi menüsü">
-            {securityMenuItems.map((item) => (
-              <button
-                className={item.label === activeSection ? 'active' : ''}
-                type="button"
-                key={item.label}
-                onClick={() => setActiveSection(item.label)}
-              >
-                <span>{item.icon}</span>
-                {item.label}
-              </button>
-            ))}
-          </aside>
+    <DashboardLayout
+      activeSection={activeSection}
+      ariaLabel="Plaka Tanıma Sistemi güvenlik ekranı"
+      menuAriaLabel="Güvenlik görevlisi menüsü"
+      menuItems={securityMenuItems}
+      menuOpen={menuOpen}
+      onMenuToggle={() => setMenuOpen((current) => !current)}
+      onSectionChange={setActiveSection}
+      pageClassName="dashboard-page"
+      roleLabel="Güvenlik Görevlisi"
+      userName={currentUserName}
+    >
+      <section className="security-main manager-main">
+        {activeSection === 'Ana Menü' && (
+          <SecurityPanelHome entryLogs={entryLogs} exitLogs={exitLogs} />
         )}
 
-        <section className="security-main">
-          {activeSection === 'Ana Menü' && (
-  <SecurityPanelHome
-    entryLogs={entryLogs}
-    exitLogs={exitLogs}
-  />
-)}
-          {activeSection === 'Beklenen Araçlar' && (
-            <SecuritySectionPlaceholder
-              title="Beklenen Araçlar"
-              message={
-                 plannedEntries.length > 0
-                  ? 'Beklenen araçlar burada listelenecek.'
-                  : 'Beklenen araç bulunmuyor.'
-              }
-            />
-          )}
-          
-          {activeSection === 'Kara Liste' && (
-            <SecuritySectionPlaceholder
-              title="Kara Liste"
-              message={
-                blacklistVehicles.length > 0
-                  ? 'Kara liste kayıtları burada listelenecek.'
-                  : activeBlacklistVehicles.length > 0
-                    ? `${activeBlacklistVehicles.length} kara liste kaydı bulundu.`
-                    : 'Kara listede araç bulunmuyor.'
-              }
-            />
-          )}
-        </section>
-      </div>
-    </main>
+        {activeSection === 'Beklenen Araçlar' && (
+          <SecuritySectionPlaceholder
+            title="Beklenen Araçlar"
+            message={
+              plannedEntries.length > 0
+                ? 'Beklenen araçlar burada listelenecek.'
+                : 'Beklenen araç bulunmuyor.'
+            }
+          />
+        )}
+
+        {activeSection === 'Kara Liste' && (
+          <SecuritySectionPlaceholder
+            title="Kara Liste"
+            message={
+              blacklistVehicles.length > 0
+                ? 'Kara liste kayıtları burada listelenecek.'
+                : activeBlacklistVehicles.length > 0
+                  ? `${activeBlacklistVehicles.length} kara liste kaydı bulundu.`
+                  : 'Kara listede araç bulunmuyor.'
+            }
+          />
+        )}
+      </section>
+    </DashboardLayout>
   )
 }
 

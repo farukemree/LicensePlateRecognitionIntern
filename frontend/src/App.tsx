@@ -1,5 +1,8 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
-import './App.css'
+import './styles/login.css'
+import './styles/security.css'
+import './styles/warehouse.css'
+import './styles/admin.css'
 
 import LoginPage from './pages/LoginPage'
 import SecurityDashboardPage from './pages/SecurityDashboardPage'

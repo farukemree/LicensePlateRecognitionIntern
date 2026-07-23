@@ -1,17 +1,13 @@
 ﻿import { useState } from 'react'
 import type { ReactNode } from 'react'
-import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined'
 import BlockOutlinedIcon from '@mui/icons-material/BlockOutlined'
 import CalendarMonthOutlinedIcon from '@mui/icons-material/CalendarMonthOutlined'
 import DirectionsCarOutlinedIcon from '@mui/icons-material/DirectionsCarOutlined'
 import HomeOutlinedIcon from '@mui/icons-material/HomeOutlined'
-import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown'
 import LocalShippingOutlinedIcon from '@mui/icons-material/LocalShippingOutlined'
-import MenuOutlinedIcon from '@mui/icons-material/MenuOutlined'
-import NotificationsNoneOutlinedIcon from '@mui/icons-material/NotificationsNoneOutlined'
 import VideocamOutlinedIcon from '@mui/icons-material/VideocamOutlined'
 import WarehouseOutlinedIcon from '@mui/icons-material/WarehouseOutlined'
-import dhlLogo from '../assets/dhl-logo.png'
+import DashboardLayout from '../components/layout/DashboardLayout'
 import ExpectedVehiclesView from '../components/warehouse/expected/ExpectedVehiclesView'
 
 import BlacklistView from '../components/warehouse/blacklist/BlacklistView'
@@ -57,52 +53,18 @@ function WarehouseManagerPage() {
   const currentUserName = 'Beyza Bora'
 
   return (
-    <main className="manager-page" aria-label="Depo yöneticisi ekranı">
-      <header className="manager-header">
-        <div className="manager-brand">
-          <img className="manager-logo" src={dhlLogo} alt="DHL" />
-          <h1>Plaka Tanıma Sistemi</h1>
-          <button
-            className="manager-menu-toggle"
-            type="button"
-            aria-label="Menüyü aç veya kapat"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((current) => !current)}
-          >
-            <MenuOutlinedIcon />
-          </button>
-        </div>
-
-        <div className="manager-user-actions">
-          <button className="manager-icon-button" type="button" aria-label="Bildirimler">
-            <NotificationsNoneOutlinedIcon />
-          </button>
-          <button className="manager-profile" type="button">
-            <AccountCircleOutlinedIcon />
-            <span>{currentUserName}</span>
-            <KeyboardArrowDownIcon />
-          </button>
-        </div>
-      </header>
-
-      <div className={`manager-layout${menuOpen ? ' menu-open' : ''}`}>
-        {menuOpen && (
-          <aside className="manager-sidebar" aria-label="Depo yöneticisi menüsü">
-            {managerMenuItems.map((item) => (
-              <button
-                className={item.label === activeSection ? 'active' : ''}
-                type="button"
-                key={item.label}
-                onClick={() => setActiveSection(item.label)}
-              >
-                <span>{item.icon}</span>
-                {item.label}
-              </button>
-            ))}
-          </aside>
-        )}
-
-        <section className="manager-main">
+    <DashboardLayout
+      activeSection={activeSection}
+      ariaLabel="Depo yöneticisi ekranı"
+      menuAriaLabel="Depo yöneticisi menüsü"
+      menuItems={managerMenuItems}
+      menuOpen={menuOpen}
+      onMenuToggle={() => setMenuOpen((current) => !current)}
+      onSectionChange={setActiveSection}
+      roleLabel="Depo Yöneticisi"
+      userName={currentUserName}
+    >
+      <section className="manager-main">
           {activeSection === 'Ana Menü' && <DashboardOverview />}
           {activeSection === 'Beklenen Araçlar' && (
             <ExpectedVehiclesView vehicles={expectedVehicles} />
@@ -115,9 +77,8 @@ function WarehouseManagerPage() {
             activeSection !== 'Kara Liste' && (
             <ManagerSectionPlaceholder title={activeSection} />
           )}
-        </section>
-      </div>
-    </main>
+      </section>
+    </DashboardLayout>
   )
 }
 

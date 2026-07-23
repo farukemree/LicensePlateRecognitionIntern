@@ -1,0 +1,408 @@
+/* ===========================
+   ADMIN HOME
+=========================== */
+
+.admin-home{
+    display:flex;
+    flex-direction:column;
+    gap:28px;
+}
+
+/* ===========================
+   HEADER
+=========================== */
+
+.admin-home-heading{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    gap:30px;
+}
+
+.admin-home-heading small{
+    font-size:14px;
+    color:#6b7280;
+    font-weight:500;
+}
+
+.admin-home-heading h2{
+    margin-top:6px;
+    font-size:38px;
+    font-weight:700;
+    color:#1f2937;
+}
+
+.admin-home-heading p{
+    margin-top:6px;
+    max-width:520px;
+    text-align:right;
+    font-size:15px;
+    color:#6b7280;
+    line-height:1.6;
+}
+
+
+/* ===========================
+   KPI GRID
+=========================== */
+
+.admin-kpi-grid{
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:22px;
+}
+
+.admin-kpi-card{
+    position:relative;
+    background:#fff;
+    border-radius:20px;
+    padding:26px;
+    box-shadow:0 12px 30px rgba(0,0,0,.08);
+    overflow:hidden;
+    transition:.25s;
+}
+
+.admin-kpi-card:hover{
+    transform:translateY(-5px);
+    box-shadow:0 18px 40px rgba(0,0,0,.12);
+}
+
+.admin-kpi-card::before{
+    content:"";
+    position:absolute;
+    left:0;
+    top:0;
+    width:4px;
+    height:100%;
+    background:#ffcc00;
+}
+
+.admin-kpi-card:nth-child(2)::before{
+    background:#22c55e;
+}
+
+.admin-kpi-card:nth-child(3)::before{
+    background:#3b82f6;
+}
+
+.admin-kpi-card:nth-child(4)::before{
+    background:#ef4444;
+}
+
+.admin-kpi-header{
+    display:flex;
+    align-items:center;
+    gap:16px;
+}
+
+.admin-kpi-icon{
+    width:52px;
+    height:52px;
+    border-radius:50%;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:24px;
+    background:#fff5d6;
+    color:#f59e0b;
+}
+
+.admin-kpi-card:nth-child(2) .admin-kpi-icon{
+    background:#dcfce7;
+    color:#16a34a;
+}
+
+.admin-kpi-card:nth-child(3) .admin-kpi-icon{
+    background:#dbeafe;
+    color:#2563eb;
+}
+
+.admin-kpi-card:nth-child(4) .admin-kpi-icon{
+    background:#fee2e2;
+    color:#dc2626;
+}
+
+.admin-kpi-header h3{
+    margin:0;
+    font-size:19px;
+    font-weight:600;
+}
+
+.admin-kpi-card strong{
+    display:block;
+    margin:18px 0;
+    font-size:52px;
+    font-weight:700;
+    color:#111827;
+}
+
+.admin-kpi-footer{
+    display:flex;
+    align-items:center;
+    gap:14px;
+}
+
+.badge{
+    padding:5px 12px;
+    border-radius:999px;
+    font-size:13px;
+    font-weight:700;
+    background:#fff5d6;
+    color:#b45309;
+}
+
+.admin-kpi-card:nth-child(2) .badge{
+    background:#dcfce7;
+    color:#15803d;
+}
+
+.admin-kpi-card:nth-child(3) .badge{
+    background:#dbeafe;
+    color:#2563eb;
+}
+
+.admin-kpi-card:nth-child(4) .badge{
+    background:#fee2e2;
+    color:#dc2626;
+}
+
+.admin-kpi-footer small{
+    color:#6b7280;
+    font-size:14px;
+}
+
+/* ===========================
+   CONTENT GRID
+=========================== */
+
+.admin-home-grid{
+    display:grid;
+    grid-template-columns:2fr 1.2fr;
+    gap:24px;
+}
+
+.admin-panel{
+    background:#fff;
+    border-radius:20px;
+    box-shadow:0 12px 30px rgba(0,0,0,.08);
+    padding:28px;
+}
+
+.admin-panel h3{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-bottom:22px;
+    font-size:24px;
+    font-weight:700;
+    color:#1f2937;
+}
+
+/* ===========================
+   EMPTY STATE
+=========================== */
+
+.admin-empty-state{
+    height:320px;
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    align-items:center;
+    gap:18px;
+}
+
+.icon-box{
+    width:82px;
+    height:82px;
+    border-radius:50%;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    background:#f3f4f6;
+    color:#9ca3af;
+    font-size:40px;
+}
+
+.admin-empty-state span{
+    color:#6b7280;
+    font-size:18px;
+}
+
+/* ===========================
+   STATUS
+=========================== */
+
+.admin-status-list{
+    list-style:none;
+    padding:0;
+    margin:0;
+}
+
+.admin-status-list li{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:20px 0;
+    border-bottom:1px solid #ececec;
+}
+
+.admin-status-list li:last-child{
+    border:none;
+}
+
+.admin-status-left{
+    display:flex;
+    align-items:center;
+    gap:14px;
+}
+
+.admin-status-check{
+    color:#16a34a;
+    font-size:22px;
+}
+
+.admin-status-tag{
+    padding:6px 14px;
+    background:#dcfce7;
+    border-radius:999px;
+    color:#16a34a;
+    font-weight:600;
+    font-size:14px;
+}
+
+.admin-status-value{
+    font-weight:600;
+    color:#374151;
+}
+
+/* ===========================
+   SUMMARY
+=========================== */
+
+.admin-summary-list{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    list-style:none;
+    padding:0;
+    margin:0;
+}
+
+.admin-summary-list li{
+    display:flex;
+    align-items:center;
+    gap:18px;
+    padding:18px 30px;
+}
+
+.admin-summary-list li:not(:last-child){
+    border-right:1px solid #ececec;
+}
+
+.admin-summary-icon{
+    width:60px;
+    height:60px;
+    border-radius:18px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:28px;
+    background:#fff5d6;
+    color:#f59e0b;
+}
+
+.admin-summary-list li:nth-child(2) .admin-summary-icon{
+    background:#dcfce7;
+    color:#16a34a;
+}
+
+.admin-summary-list li:nth-child(3) .admin-summary-icon{
+    background:#dbeafe;
+    color:#2563eb;
+}
+
+.admin-summary-info span{
+    display:block;
+    color:#6b7280;
+    margin-bottom:6px;
+    font-size:15px;
+}
+
+.admin-summary-info strong{
+    font-size:40px;
+    font-weight:700;
+    color:#111827;
+}
+
+/* ===========================
+   RESPONSIVE
+=========================== */
+
+@media(max-width:1200px){
+
+.admin-kpi-grid{
+grid-template-columns:repeat(2,1fr);
+}
+
+.admin-home-grid{
+grid-template-columns:1fr;
+}
+
+.admin-summary-list{
+grid-template-columns:1fr;
+}
+
+.admin-summary-list li{
+border-right:none !important;
+border-bottom:1px solid #ececec;
+}
+
+}
+
+@media(max-width:900px){
+
+.admin-home-heading h2{
+font-size:30px;
+}
+
+.admin-home-heading p{
+max-width:none;
+}
+
+.admin-kpi-card,
+.admin-panel{
+padding:20px;
+}
+
+.admin-kpi-card strong{
+font-size:42px;
+}
+
+.admin-panel h3{
+font-size:20px;
+}
+
+.admin-summary-list li{
+padding:16px 18px;
+}
+
+.admin-summary-info strong{
+font-size:32px;
+}
+
+}
+
+@media(max-width:768px){
+
+.admin-home-heading{
+flex-direction:column;
+}
+
+.admin-home-heading p{
+text-align:left;
+}
+
+.admin-kpi-grid{
+grid-template-columns:1fr;
+}
+
+}
