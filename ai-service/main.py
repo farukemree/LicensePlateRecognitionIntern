@@ -1,233 +1,660 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+"""
+Lojistik Plaka Tanıma AI Servisi
+================================
+
+Mimari (kare -> plaka metni yolculuğu):
+
+    RTSP okuyucu thread'i  (daima EN GÜNCEL kare, bayat kare yok)
+              |
+    COCO araç tespiti      (araç yoksa plaka aranmaz -> arka plan tabelaları elenir)
+              |
+    Plaka tespiti          (SADECE araç kutusunun içinde)
+              |
+    Kutu daraltma          (YOLO kutusu plakadan yüksek olur; karakter bandına kırp)
+              |
+    OCR varyantları        (birkaç nazik ön-işleme; agresif binarizasyon yok)
+              |
+    Parça birleştirme      (aynı satırdaki parçalar soldan sağa)
+              |
+    GRAMER ÇÖZÜMLEYİCİ     (TR plaka dilbilgisi + konum-farkında karakter düzeltme)
+              |
+    Zamansal mutabakat     (bir plaka birden fazla karede tekrar etmeli)
+              |
+    .NET API
+
+Önceki sürüme göre kaldırılan iki mekanizma ve nedenleri, aşağıdaki ilgili
+bölümlerde ayrıntılı yorumlarla açıklanmıştır (kendi kendine öğrenen metin
+kara listesi ve "esnek eşleştirme" fallback'i).
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Tuple
+from collections import deque
 from contextlib import asynccontextmanager
 import uvicorn
 import requests
+import asyncio
+import itertools
+import logging
 import time
 import os
 import re
 import json
 import base64
-import logging
 import threading
+import sys
 from urllib.parse import quote
 
-# 🪵 Logging kurulumu (print yerine seviyeli logging). Seviye LOG_LEVEL env'inden.
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
-)
-logger = logging.getLogger("ai-service")
+# 🩹 CANLI LOG: stdout bir terminale değil bir boruya (docker logs) gittiğinde
+# Python blok bazlı tamponlama yapar ve print() çıktısı anında görünmez.
+# Satır bazlı tamponlamaya zorluyoruz. (Dockerfile'da PYTHONUNBUFFERED=1 ile
+# iki katmanlı güvence altında.)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
-# 🚨 OpenCV'yi TCP'ye zorlayacak çevresel değişkeni cv2'den ÖNCE set ediyoruz!
+# 🚨 OpenCV'yi RTSP'de TCP'ye zorlayan değişken cv2'den ÖNCE set edilmeli.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
-import cv2  # 👈 Çevresel değişken ayarlandıktan hemen sonra import ediliyor!
+import cv2
+import numpy as np
 from datetime import datetime, timezone
 import torch
 
-# 🔓 PyTorch 2.6+ weights_only bypass (kendi güvenilir .pt dosyamız için)
+# 🔓 PyTorch 2.6+ weights_only bypass (kendi güvenilir .pt dosyalarımız için)
 _original_torch_load = torch.load
 def _patched_torch_load(*args, **kwargs):
     kwargs.setdefault("weights_only", False)
     return _original_torch_load(*args, **kwargs)
 torch.load = _patched_torch_load
 
-from ultralytics import YOLO   # 👈 patch'ten SONRA import edilmeli
+from ultralytics import YOLO  # 👈 patch'ten SONRA import edilmeli
 import easyocr
-import torch.nn as nn
 
-# 🧵 Çok kameralı (çok thread'li) güvenlik: aynı YOLO/EasyOCR nesneleri birden
-# fazla kamera thread'i tarafından paylaşıldığı için, model çıkarımlarını tek
-# bir kilit altında seri hale getiriyoruz. PyTorch/Ultralytics çıkarımı
-# thread-safe değildir; kilitsiz durumda sonuçlar birbirine karışabilir.
+# 🧵 ÇOK KAMERALI THREAD GÜVENLİĞİ
+# Aynı YOLO/EasyOCR nesneleri iki kamera thread'i tarafından paylaşılıyor.
+# PyTorch/Ultralytics çıkarımı thread-safe DEĞİLDİR; kilitsiz durumda iki
+# kameranın sonuçları birbirine karışabilir. Tüm model çağrıları bu kilidin
+# altında seri hâle getirilir.
 INFERENCE_LOCK = threading.Lock()
 # 📡 /readyz için otomatik başlatılan kamera thread'lerini takip ediyoruz.
-AKTIF_THREADLER = []
+AKTIF_THREADLER: List[threading.Thread] = []
 
 
-# 🚀 --- OTOMATİK BAŞLATMA (lifespan) ---
-# Servis ayağa kalkınca Gebze giriş/çıkış kameraları otomatik izlemeye başlar.
-# (Eski @app.on_event("startup") FastAPI'de deprecate oldu — lifespan kullanıyoruz.)
+# ==========================================================================
+# 📝 LOG ALTYAPISI — canlı izlenebilir
+# ==========================================================================
+# Loglar hem stdout'a (docker logs) hem de bellekteki halka tampona yazılır.
+# Tampon sayesinde /api/v1/loglar ve /loglar (tarayıcıdan canlı izleme)
+# uçları çalışır — "docker logs"a erişimi olmayan biri de akışı görebilir.
+
+LOG_TAMPON_BOYUTU = int(os.getenv("LOG_TAMPON_BOYUTU", "3000"))
+LOG_TAMPONU = deque(maxlen=LOG_TAMPON_BOYUTU)
+_log_kilit = threading.Lock()
+_log_sayac = itertools.count()
+
+# 🔊 AYRINTI SEVİYESİ: "sessiz" | "normal" | "ayrintili"
+# Önceki sürümde her elenen kutu için satır basılıyordu; saniyede onlarca
+# kare işlendiği için log akışı okunamaz hale geliyordu. Kare bazlı ayrıntılar
+# artık sadece "ayrintili" modda basılır.
+LOG_SEVIYESI = os.getenv("LOG_SEVIYESI", "normal").lower()
+_AYRINTILI = LOG_SEVIYESI == "ayrintili"
+_SESSIZ = LOG_SEVIYESI == "sessiz"
+
+# 📋 Standart logging altyapısı (LOG_LEVEL env ile ayarlanır).
+# Konsola yazma işini logging yapar; log() ayrıca canlı tampona da yazar,
+# böylece /loglar sayfası ve SSE akışı çalışmaya devam eder.
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("plaka-ai")
+
+# log() 'tur' değeri -> logging seviyesi eşlemesi
+_SEVIYE_ESLEME = {
+    "hata": logging.ERROR,
+    "uyari": logging.WARNING,
+    "ayrinti": logging.DEBUG,
+    "basari": logging.INFO,
+    "bilgi": logging.INFO,
+}
+
+
+def log(mesaj: str, tur: str = "bilgi"):
+    """Tek log satırı üretir: hem logging'e hem canlı tampona."""
+    kayit = {
+        "id": next(_log_sayac),
+        "zaman": datetime.now().strftime("%H:%M:%S"),
+        "tur": tur,
+        "mesaj": mesaj,
+    }
+    with _log_kilit:
+        LOG_TAMPONU.append(kayit)
+    if not _SESSIZ:
+        logger.log(_SEVIYE_ESLEME.get(tur, logging.INFO), mesaj)
+
+
+def log_ayrinti(mesaj: str):
+    """Sadece LOG_SEVIYESI=ayrintili iken görünen, kare bazlı gürültülü loglar."""
+    if _AYRINTILI:
+        log(mesaj, tur="ayrinti")
+
+
+# 🚀 OTOMATİK BAŞLATMA (lifespan)
+# Eski @app.on_event("startup") FastAPI'de deprecate oldu — lifespan kullanıyoruz.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DEPOT_ID:
-        logger.warning("⚠️ DEPOT_ID env değişkeni boş! Backend 'depot_id' (UUID) zorunlu — event'ler reddedilebilir.")
+        log("⚠️ DEPOT_ID env değişkeni boş! Backend 'depot_id' (UUID) zorunlu — "
+            "event'ler reddedilebilir.", "uyari")
     for kamera in GEBZE_KAMERALARI:
-        logger.info(f"🚀 [OTOMATİK BAŞLATMA] {kamera['isim']} (id={kamera['kamera_id']}, yön={kamera['yon']}) başlatılıyor...")
+        log(f"🚀 [OTOMATİK BAŞLATMA] {kamera['isim']} (id={kamera['kamera_id']})")
         thread = threading.Thread(
             target=gercek_yolo_ocr_pipeline,
             args=(kamera["kamera_id"], kamera["depo_id"], kamera["rtsp_url"], kamera["yon"]),
-            daemon=True,
-            name=f"kamera-{kamera['kamera_id']}-{kamera['yon']}",
-        )
+            daemon=True, name=f"kamera-{kamera['kamera_id']}-{kamera['yon']}")
         thread.start()
         AKTIF_THREADLER.append(thread)
     yield
-    logger.info("🛑 Servis kapanıyor — kamera thread'leri (daemon) süreçle birlikte sonlanır.")
+    log("🛑 Servis kapanıyor — kamera thread'leri (daemon) süreçle birlikte sonlanır.")
 
 
-app = FastAPI(title="Lojistik Plaka Tanıma AI Servisi", version="1.3", lifespan=lifespan)
+app = FastAPI(title="Lojistik Plaka Tanıma AI Servisi", version="2.1", lifespan=lifespan)
 
-# Yeniden eğitim için veri setinin birikeceği klasörü oluşturuyoruz
-RETRAIN_DIR = "/app/dataset/retrain"
+RETRAIN_DIR = os.getenv("RETRAIN_DIR", "/app/dataset/retrain")
 os.makedirs(RETRAIN_DIR, exist_ok=True)
 
-# 🐞 TEŞHİS MODU: Açıksa, YOLO'nun kırptığı HER HAM kareyi diske kaydeder.
-DEBUG_KARE_KAYDET = os.getenv("DEBUG_KARE_KAYDET", "false").lower() == "true"
-DEBUG_KARE_DIR = "/app/debug_kareler"
-if DEBUG_KARE_KAYDET:
-    os.makedirs(DEBUG_KARE_DIR, exist_ok=True)
-    logger.info(f"🐞 TEŞHİS MODU AKTİF: Ham kareler '{DEBUG_KARE_DIR}' klasörüne kaydedilecek.")
-
-# 🐞 ORİJİNAL KARE TEŞHİS MODU: Açıksa, her araç episode'unda en yüksek skorlu
-# karenin TAM görüntüsünü (YOLO kutusuyla birlikte) diske kaydeder.
-DEBUG_ORIJINAL_KARE_KAYDET = os.getenv("DEBUG_ORIJINAL_KARE_KAYDET", "false").lower() == "true"
-DEBUG_ORIJINAL_KARE_DIR = os.getenv("DEBUG_ORIJINAL_KARE_DIR", os.path.join(DEBUG_KARE_DIR, "orijinal"))
-if DEBUG_ORIJINAL_KARE_KAYDET:
-    os.makedirs(DEBUG_ORIJINAL_KARE_DIR, exist_ok=True)
-    logger.info(f"🐞 ORİJİNAL KARE TEŞHİS MODU AKTİF: Tam kareler (YOLO kutusu çizili) '{DEBUG_ORIJINAL_KARE_DIR}' klasörüne kaydedilecek.")
-
-logger.info("🧠 YOLOv8 ve EasyOCR modelleri belleğe yükleniyor...")
-model = YOLO("license_plate_detector.pt")  # Plaka tespiti
-detection_model = YOLO("yolov8m.pt")       # Araç/İnsan tespiti (COCO dataset)
-
-# 🎯 --- TESPİT KALİTESİ AYARLARI --- (.env üzerinden değiştirilebilir, deploy gerekmez)
-PLAKA_CONF_ESIGI = float(os.getenv("PLAKA_CONF_ESIGI", "0.4"))
-PLAKA_IMGSZ = int(os.getenv("PLAKA_IMGSZ", "1280"))
-
-# 🚗 COCO Veri Seti Sınıfları
-COCO_CLASSES = {
-    0: "insan", 2: "araba", 3: "motosiklet", 5: "otobüs", 7: "kamyon",
-    15: "kedi", 16: "köpek"  # bonus
-}
-
-easyocr_cache_dir = os.getenv("EASYOCR_MODULE_DATA_DIR", "/app/.easyocr")
-gpu_kullanilabilir = torch.cuda.is_available()
-logger.info(f"🖥️ GPU durumu: {'AKTİF ✅' if gpu_kullanilabilir else 'PASİF (CPU üzerinde çalışılıyor) ⚠️'}")
-reader = easyocr.Reader(['tr', 'en'], gpu=gpu_kullanilabilir, model_storage_directory=easyocr_cache_dir)
-logger.info("✅ Modeller başarıyla yüklendi, sistem tetikte!")
-
-# 🖼️ --- YAKALANAN GÖRSELLERİN SERVİS EDİLMESİ ---
-# Okunan aracın görselini diske yazıp HTTP üzerinden servis ediyoruz; backend'e
-# base64 yerine erişilebilir bir image_url gönderiyoruz (Go tarafı 'image_url' bekliyor).
+# 🖼️ YAKALANAN GÖRSELLER — backend base64 değil, erişilebilir bir URL bekliyor.
+# Görseller diske yazılıp /captures altından statik olarak sunuluyor.
 CAPTURES_DIR = os.getenv("CAPTURES_DIR", "/app/captures")
 os.makedirs(CAPTURES_DIR, exist_ok=True)
 AI_SERVICE_PUBLIC_BASE_URL = os.getenv("AI_SERVICE_PUBLIC_BASE_URL", "http://localhost:8000")
 app.mount("/captures", StaticFiles(directory=CAPTURES_DIR), name="captures")
 
+DEBUG_KARE_KAYDET = os.getenv("DEBUG_KARE_KAYDET", "false").lower() == "true"
+DEBUG_KARE_DIR = "/app/debug_kareler"
+if DEBUG_KARE_KAYDET:
+    os.makedirs(DEBUG_KARE_DIR, exist_ok=True)
 
-# 📷 PLAKA OKUMASINI İYİLEŞTİREN PREPROCESSING FONKSİYONU
-def plaka_ocr_preprocessing(plaka_gorsel):
-    """Kırpılan plaka görseline contrast + sharpness ekle"""
-    import numpy as np
+DEBUG_ORIJINAL_KARE_KAYDET = os.getenv("DEBUG_ORIJINAL_KARE_KAYDET", "false").lower() == "true"
+DEBUG_ORIJINAL_KARE_DIR = os.getenv("DEBUG_ORIJINAL_KARE_DIR", os.path.join(DEBUG_KARE_DIR, "orijinal"))
+if DEBUG_ORIJINAL_KARE_KAYDET:
+    os.makedirs(DEBUG_ORIJINAL_KARE_DIR, exist_ok=True)
 
-    # 1️⃣ Contrast Enhancement (CLAHE)
-    lab = cv2.cvtColor(plaka_gorsel, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    enhanced = cv2.merge([l, a, b])
-    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
-    # 2️⃣ Resize (Daha büyük → OCR daha iyi)
-    h, w = enhanced.shape[:2]
-    if w < 400:
-        scale = 400 / w
-        enhanced = cv2.resize(enhanced, (int(w * scale), int(h * scale)),
-                              interpolation=cv2.INTER_CUBIC)
+# ==========================================================================
+# 🧠 MODELLER
+# ==========================================================================
+log("🧠 YOLOv8 ve EasyOCR modelleri belleğe yükleniyor...")
+model = YOLO("license_plate_detector.pt")   # Plaka tespiti
+detection_model = YOLO("yolov8m.pt")        # Araç/insan tespiti (COCO)
 
-    # 3️⃣ Bilateral Filter (Noise azalt, kenarlar koruyarak)
-    enhanced = cv2.bilateralFilter(enhanced, 9, 75, 75)
+COCO_CLASSES = {0: "insan", 2: "araba", 3: "motosiklet", 5: "otobüs", 7: "kamyon"}
+COCO_ARAC_SINIFLARI = {2, 3, 5, 7}
 
-    return enhanced
+gpu_kullanilabilir = torch.cuda.is_available()
+AI_DEVICE = 0 if gpu_kullanilabilir else "cpu"
+log(f"🖥️ GPU durumu: {'AKTİF ✅' if gpu_kullanilabilir else 'PASİF (CPU) ⚠️'}")
 
-# --- 📋 VERİ YAPILARI ---
-class KameraIstek(BaseModel):
-    kamera_id: int
-    depo_id: int
-    rtsp_url: str
-    yon: Optional[str] = "bilinmiyor"   # "giris" / "cikis" — manuel testler için opsiyonel
-    aktif_mi: Optional[bool] = True
+easyocr_cache_dir = os.getenv("EASYOCR_MODULE_DATA_DIR", "/app/.easyocr")
+# 🔤 Dil seti ÖLÇÜMLE seçildi. Gerçek bir sahne karesi üzerinde 64
+# kombinasyon denendiğinde ['tr','en'] 17/32, sadece ['en'] 11/32 doğru okudu.
+# ("Plakada Türkçe karakter yok, İngilizce yeter" varsayımı yanlış çıktı —
+# tr modeli bu karakter setinde belirgin şekilde daha isabetli.)
+reader = easyocr.Reader(["tr", "en"], gpu=gpu_kullanilabilir,
+                        model_storage_directory=easyocr_cache_dir)
+log("✅ Modeller başarıyla yüklendi, sistem tetikte!")
 
-class PlakaVeriPaketi(BaseModel):
-    kamera_id: int
-    depo_id: int
-    yon: str            # "giris" veya "cikis" — hangi kapıdan geçtiğini ayırt etmek için
-    plaka_metni: str
-    arac_tipi: str      # "araba", "kamyon", "otobüs" vb.
-    guven_skoru: float
-    tarih_saat: str
-    image_url: Optional[str] = None  # 🖼️ Yakalanan araç görselinin erişilebilir URL'si
-    plaka_gorseli_base64: Optional[str] = None  # 🖼️ Okunan plakanın kırpılmış görseli (JPEG, base64) — opsiyonel
-    tam_kare_gorseli_base64: Optional[str] = None  # 🖼️ Aracın tam kare görseli (YOLO kutusu ile), opsiyonel
 
-class PlakaDuzeltmeIstek(BaseModel):
-    kamera_id: int      # Hangi kameranın görüntüsü düzeltilecek (giriş mi çıkış mı)
-    yanlis_plaka: str
-    dogru_plaka: str
+# ==========================================================================
+# 🎯 AYARLAR (hepsi .env üzerinden değiştirilebilir, deploy gerekmez)
+# ==========================================================================
+PLAKA_CONF_ESIGI = float(os.getenv("PLAKA_CONF_ESIGI", "0.35"))
+PLAKA_IMGSZ = int(os.getenv("PLAKA_IMGSZ", "1280"))
+ARAC_TESPIT_CONF = float(os.getenv("ARAC_TESPIT_CONF", "0.45"))
 
-# 🎥 --- SABİT KAMERA TANIMLARI (GEBZE) ---
-# Servis ayağa kalktığında bu kameralar otomatik izlemeye başlar. Kimlik bilgileri
-# ve adresler artık kaynak koda gömülü DEĞİL — env üzerinden okunuyor (varsayılanlar
-# eski davranışı korur). Şifredeki '@' karakteri URL ayracı olduğu için %40 olarak
-# encode edilmeli (quote() bunu garantiler).
-_GEBZE_KULLANICI = os.getenv("GEBZE_KAMERA_KULLANICI", "admin")
-_GEBZE_SIFRE = os.getenv("GEBZE_KAMERA_SIFRE", "center@dhl99")
-_GEBZE_SIFRE_ENCODED = quote(_GEBZE_SIFRE, safe="")
-_GEBZE_HOST = os.getenv("GEBZE_KAMERA_HOST", "2.200.168.165")
-_GEBZE_GIRIS_PORT = os.getenv("GEBZE_GIRIS_PORT", "8001")
-_GEBZE_CIKIS_PORT = os.getenv("GEBZE_CIKIS_PORT", "8003")
+# 🚗 Plaka için araç şartı: Plaka dedektörünü SADECE bir araç tespit edilen
+# karelerde, SADECE araç kutusunun içinde çalıştırıyoruz. Önceki sürümde araç
+# bulunamayınca "tüm karede ara" fallback'i vardı; arka plandaki sabit
+# tabelaların/çıkartmaların OCR'a sızmasının ana yolu buydu. Araçlar hareket
+# eder, tabelalar etmez — bu şart, sabit yanlış pozitifleri kökten keser.
+PLAKA_ARAC_ZORUNLU = os.getenv("PLAKA_ARAC_ZORUNLU", "true").lower() == "true"
 
-# 📡 RTSP PROFİL SEÇİMİ: profile1 = ana akış (yüksek çözünürlük, OCR için önerilir),
-# profile2/3 = alt akış. Bant genişliği sorununda .env'den "profile2" yapılabilir.
-RTSP_PROFIL = os.getenv("RTSP_PROFIL", "profile1")
+# 📐 Plaka kutusu en/boy oranı aralığı. TR plakası 4.6:1'dir ama YOLO kutusu
+# plaka yuvasını da kapsadığı ve perspektif oranı sıkıştırdığı için gerçekte
+# 1.6-6.0 arasında ölçülüyor. Aralığı gerçek ölçümlere göre bilerek geniş
+# tutuyoruz: yanlış pozitifi elemek OCR'ın değil, "araç şartı"nın işi.
+PLAKA_EN_BOY_MIN = float(os.getenv("PLAKA_EN_BOY_MIN", "1.6"))
+PLAKA_EN_BOY_MAX = float(os.getenv("PLAKA_EN_BOY_MAX", "7.0"))
+# 📏 Okunabilirlik alt sınırı. Sahada doğru okunan plaka 321px genişlikteydi;
+# 80px'lik uzak bir plakadan (örn. camın arkasından görünen başka bir araç)
+# hiçbir varyantta metin çıkmıyor. Bu tür kutuları OCR'a hiç sokmuyoruz:
+# hem boşuna işlem, hem de oylama havuzunu kirletiyorlar.
+PLAKA_MIN_GENISLIK = int(os.getenv("PLAKA_MIN_GENISLIK", "100"))
 
-GEBZE_KAMERALARI = [
-    {
-        "kamera_id": 1,
-        "depo_id": 1,
-        "yon": "giris",
-        "isim": "Gebze Giriş Kamerası",
-        "rtsp_url": f"rtsp://{_GEBZE_KULLANICI}:{_GEBZE_SIFRE_ENCODED}@{_GEBZE_HOST}:{_GEBZE_GIRIS_PORT}/{RTSP_PROFIL}/media.smp",
-    },
-    {
-        "kamera_id": 2,
-        "depo_id": 1,
-        "yon": "cikis",
-        "isim": "Gebze Çıkış Kamerası",
-        "rtsp_url": f"rtsp://{_GEBZE_KULLANICI}:{_GEBZE_SIFRE_ENCODED}@{_GEBZE_HOST}:{_GEBZE_CIKIS_PORT}/{RTSP_PROFIL}/media.smp",
-    },
-]
+# 🚚 PLAKA / ARAÇ ALAN ORANI — kamyonet kapısındaki firma yazısına karşı.
+# 2026-07-23 sahada: bir kamyonetin yan kapısındaki "TECHNICAL SERVICES /
+# SECURITY / CATERING" yazısı 792x407px'lik bir kutuyla plaka sanıldı ve
+# '34SG948' diye okundu. En-boy oranı 1.95 olduğu için oran filtresinden
+# geçiyordu — ama bir plaka aracın YANINDA bu kadar büyük yer kaplayamaz.
+# Doğrulanmış 5 gerçek plakada ölçüm: alan oranı %2.6–5.2.
+# Sahte kutu: %16.4. Eşiği aradaki boşluğa koyuyoruz.
+PLAKA_MAKS_ARAC_ORANI = float(os.getenv("PLAKA_MAKS_ARAC_ORANI", "0.10"))
 
-# 💡 Global değişkenlerde son işlenen kareyi ve okunan plakayı tutuyoruz
-# (Kamera başına ayrı — birden fazla kamera aynı anda çalıştığı için, anahtar: kamera_id)
-son_yakalanan_goruntuler = {}
-son_okunan_plaka_global = ""
+# 🎯 Kabul eşikleri — ESKİ SÜRÜMDEKİ 0.35 ÇOK DÜŞÜKTÜ ve '44LYO63' gibi
+# tamamen uydurma okumaların backend'e gitmesine izin veriyordu.
+MIN_PLAKA_GUVENI = float(os.getenv("MIN_PLAKA_GUVENI", "0.55"))
+# Bir plakanın gönderilebilmesi için kaç FARKLI karede aynı sonucun çıkması
+# gerektiği. Tek karelik bir hata artık tek başına backend'e gidemez.
+MIN_MUTABAKAT_KARE = int(os.getenv("MIN_MUTABAKAT_KARE", "2"))
+# Tek karede bile kabul edilebilecek "çok emin" eşiği (mutabakat şartını atlar)
+TEK_KARE_KESIN_GUVEN = float(os.getenv("TEK_KARE_KESIN_GUVEN", "0.88"))
+# Tek karelik bir sonucun kabulü için, o adayın TÜM kanıtın en az bu kadarına
+# hâkim olması gerekir. Hızlı geçen araçlarda her kare farklı bir şey okuyor
+# (13AHR91 / 34HRP10 / 14HRP18 / 14HRP150...) — böyle bir kaosta en yüksek
+# skorlu aday bile güvenilir değildir, susmak doğrusudur.
+TEK_KARE_MIN_PAY = float(os.getenv("TEK_KARE_MIN_PAY", "0.35"))
+# 📊 GENEL KANIT PAYI TABANI — kaç karede göründüğünden bağımsız olarak,
+# kazanan aday tüm kanıtın en az bu kadarına hâkim olmalı.
+# 2026-07-23 canlı testinde 23 gönderimin payları ölçüldü: bağımsız olarak
+# DOĞRU olduğunu doğruladığım tüm okumalar %48 ve üzerindeydi; yalnızca iki
+# şüpheli okuma %28-30'da kalmıştı (biri kapı yazısından uydurulmuş
+# '34SG948' idi). Eşik bu boşluğa konuyor.
+MIN_KANIT_PAYI = float(os.getenv("MIN_KANIT_PAYI", "0.35"))
 
-# 💡 Backend (Go ANPR webhook) hedefi ve gönderim ayarları
+# ⏱️ Episode (araç geçişi) zamanlaması
+# 📊 Sahadan ölçüm: 270 episode'un incelenmesinde TEK bir aracın 2-3 ayrı
+# episode ürettiği görüldü (34HRR696 -> 14HRR696 -> 44HRR696 gibi). Her
+# episode ayrı ayrı oylandığı için hem oy sayısı bölünüyor (doğruluk düşüyor)
+# hem de aynı kamyon için birden fazla, üstelik çelişkili kayıt gidiyordu.
+# Sebep: plaka birkaç kare boyunca (gölge, açı, direksiyon kırma) görünmeyince
+# 1.5 sn'lik boşluk eşiği episode'u erken kapatıyordu. Eşikleri yükseltmek
+# bir aracı TEK episode'da tutuyor -> daha çok oy, daha az çift kayıt.
+ARAC_AYRILMA_BOSLUGU = float(os.getenv("ARAC_AYRILMA_BOSLUGU", "3.0"))
+MAKS_TOPLAMA_SANIYESI = float(os.getenv("MAKS_TOPLAMA_SANIYESI", "12.0"))
+MIN_ISLEME_KARE_SAYISI = int(os.getenv("MIN_ISLEME_KARE_SAYISI", "2"))
+# 🔎 Episode başına OCR'lanacak AZAMİ kare. Sahada 75 kare toplanan bir
+# episode'da sadece 6'sı okunuyordu ve doğru cevap (34HRP158) okunmayan
+# karelerde kalıyordu. Sınırı yükseltmek bedavaya gelmiyor gibi görünse de,
+# aşağıdaki erken çıkış sayesinde KOLAY vakalar artık 3 karede bitiyor —
+# yalnız ZOR vakalarda tüm bütçe kullanılıyor.
+OCR_KARE_SAYISI = int(os.getenv("OCR_KARE_SAYISI", "14"))
+# Erken çıkış: bu kadar kare aynı plakada anlaştıysa ve güven yüksekse
+# kalan kareleri okumaya gerek yok.
+ERKEN_CIKIS_OY = int(os.getenv("ERKEN_CIKIS_OY", "3"))
+ERKEN_CIKIS_GUVEN = float(os.getenv("ERKEN_CIKIS_GUVEN", "0.95"))
+# Kare içinde varyant erken çıkışı: bir varyant bu skoru yakaladıysa
+# kalan varyantlar denenmez.
+VARYANT_ERKEN_CIKIS = float(os.getenv("VARYANT_ERKEN_CIKIS", "0.95"))
+MIN_KESKINLIK = float(os.getenv("MIN_KESKINLIK", "60.0"))
+
+# 🧊 Aynı aracın tekrar tekrar işlenmesini önleyen cooldown
+COOLDOWN_SANIYE = float(os.getenv("COOLDOWN_SANIYE", "15.0"))
+COOLDOWN_IOU_ESIGI = float(os.getenv("COOLDOWN_IOU_ESIGI", "0.5"))
+# Aynı plakanın arka arkaya gönderilmesini engelleyen süre.
+# Asıl koruma yukarıdaki KONUMSAL cooldown; bu yalnızca emniyet ağı.
+# 60 sn sahada yetersiz kaldı (duran kamyon 83 sn sonra ikinci kez gönderildi).
+# Not: her kameranın kendi geçmişi var — giriş ve çıkış birbirini etkilemez,
+# yani bir aracın girip sonra çıkması iki ayrı kayıt olarak doğru şekilde kalır.
+AYNI_PLAKA_BEKLEME = float(os.getenv("AYNI_PLAKA_BEKLEME", "120.0"))
+
+# 🚫 Üst filigran/tarih-saat damgası bandını karart (0 = kapalı)
+UST_MASKE_ORANI = float(os.getenv("UST_MASKE_ORANI", "0.12"))
+
+HEARTBEAT_SANIYE = float(os.getenv("HEARTBEAT_SANIYE", "120.0"))
+
+# 🔗 BACKEND KONTRATI
+# ⚠️ Eski kod "http://192.168.1.141:5000/api/v1/plates/detected" adresine
+# POST atıyordu — repoda böyle bir .NET servisi YOK. Gerçek alıcı, Go
+# backend'in ANPR webhook'u. Yanlış adres yüzünden okunan hiçbir plaka
+# kaydedilmiyordu; loglardaki sürekli "Connection refused" bundandı.
 BACKEND_EVENTS_URL = os.getenv("BACKEND_EVENTS_URL", "http://localhost:8080/api/v1/anpr/events")
-DEPOT_ID = os.getenv("DEPOT_ID", "")  # Go backend'in beklediği gerçek depo UUID'si (zorunlu)
+# Go tarafı depot_id'yi UUID olarak ve ZORUNLU bekliyor.
+DEPOT_ID = os.getenv("DEPOT_ID", "")
+# Geriye dönük uyumluluk: base64 alanları da göndermek istersen true yap.
 GORSEL_BASE64_GONDER = os.getenv("GORSEL_BASE64_GONDER", "false").lower() == "true"
-PLAKA_TEKRAR_PENCERESI = float(os.getenv("PLAKA_TEKRAR_PENCERESI", "30"))  # sn — aynı plakayı bu süre içinde tekrar gönderme
 
-# 🧠 --- KENDİ KENDİNE ÖĞRENME: DÜZELTME HAFIZASI ---
-# Güvenlik görevlisi bir plakayı düzelttiğinde (yanlis -> dogru) kalıcı JSON'a yazılır;
-# canlı akışta benzer okumalar otomatik düzeltilir. (Gerçek retraining DEĞİL.)
+
+# ==========================================================================
+# 🔤 TÜRK PLAKA DİLBİLGİSİ VE GRAMER ÇÖZÜMLEYİCİ
+# ==========================================================================
+# Bu bölüm, bu sürümün doğruluk kazancının ana kaynağı.
+#
+# Türk plakası:  [il kodu: 2 rakam, 01-81] [1-3 harf] [2-5 rakam]
+#   1 harf -> 4 veya 5 rakam   (34 A 1234 / 34 A 12345)
+#   2 harf -> 3 veya 4 rakam   (34 AB 123 / 34 AB 1234)
+#   3 harf -> 2 veya 3 rakam   (34 ABC 12 / 34 ABC 123)
+# Yani il kodundan sonra HER ZAMAN 5 veya 6 karakter; toplam 7 veya 8.
+#
+# Eski kod OCR çıktısını olduğu gibi regex'e sokuyordu: 'B4CLY063' hiçbir
+# desene uymadığı için ÇÖPE gidiyordu. Oysa OCR'ın '3'ü 'B' okuması en yaygın
+# karıştırmalardan biri. Yeni çözümleyici, her karakteri BULUNDUĞU KONUMUN
+# gerektirdiği sınıfa (rakam mı harf mi) uyarlamayı dener ve il kodunun
+# geçerliliğini kısıt olarak kullanır:
+#
+#   'B4CLY063' -> il kodu "B4":  B->8 ise "84" (geçersiz il, >81)  ✗
+#                                B->3 ise "34" (geçerli)           ✓
+#             -> "CLY" 3 harf, "063" 3 rakam -> toplam 6 ✓
+#             -> SONUÇ: 34CLY063
+#
+# Tek bir kısıt (il kodu 01-81) belirsizliği tek başına çözüyor.
+
+IL_KODLARI = {f"{i:02d}" for i in range(1, 82)}
+PLAKA_HARFLERI = set("ABCDEFGHIJKLMNOPRSTUVYZ")  # TR plakasında Q, W, X yok
+RAKAMLAR = set("0123456789")
+
+# Harf gibi okunmuş ama rakam olması gereken karakterler.
+# ⚠️ Değerler LİSTE: bir karakterin birden fazla makul rakam karşılığı olabilir.
+# Örn. 'B' hem '8' hem '3' okunabilir — ve hangisinin doğru olduğunu il kodu
+# geçerliliği belirler ('B4' -> '84' geçersiz, '34' geçerli). Tek hedefli bir
+# eşleme bu ayrımı yapamaz ve doğru plakayı kaçırırdı.
+RAKAMA_DONUSUM = {
+    "O": ["0"], "D": ["0"], "Q": ["0"], "U": ["0"], "C": ["0"],
+    "I": ["1"], "L": ["1"], "J": ["1"], "T": ["7"], "Y": ["7"],
+    "Z": ["2"], "R": ["2"], "B": ["8", "3"], "E": ["8"], "S": ["5"],
+    "G": ["6"], "A": ["4"], "H": ["4"], "P": ["9"], "V": ["7"],
+}
+# Rakam gibi okunmuş ama harf olması gereken karakterler
+HARFE_DONUSUM = {
+    "0": ["O", "D"], "1": ["I", "L"], "2": ["Z"], "3": ["B"], "4": ["A"],
+    "5": ["S"], "6": ["G"], "7": ["T"], "8": ["B"], "9": ["G"],
+}
+# Bazı karıştırmalar diğerlerinden çok daha yaygın; ceza katsayısını
+# ona göre ayırıyoruz (yüksek katsayı = daha az cezalı = daha güvenilir).
+GUCLU_KARISTIRMA = {
+    ("O", "0"), ("0", "O"), ("I", "1"), ("1", "I"), ("B", "8"), ("8", "B"),
+    ("S", "5"), ("5", "S"), ("Z", "2"), ("2", "Z"), ("G", "6"), ("6", "G"),
+    ("D", "0"), ("L", "1"), ("A", "4"), ("4", "A"), ("T", "7"), ("7", "T"),
+    ("B", "3"), ("3", "B"),
+}
+
+CEZA_GUCLU = 0.88   # çok yaygın karıştırma — küçük ceza
+CEZA_ZAYIF = 0.62   # daha nadir karıştırma — büyük ceza
+
+# 🔢 AYNI SINIF (rakam->rakam) GÖRSEL KARIŞTIRMALARI
+# İl kodu iki rakamdır; karakterler zaten "rakam sınıfında" olduğu için
+# yukarıdaki sınıflar arası düzeltme devreye girmez. Ama OCR '3'ü '8' okuduğunda
+# ortaya "84" gibi VAR OLMAYAN bir il kodu çıkar. Bu durumda alt dizi arayışı
+# devreye girip '4CLY063' -> '40LY063' gibi UYDURMA ama biçimsel olarak geçerli
+# bir plaka üretiyordu — yani yanlış cevap, cevapsızlıktan beter bir sonuç.
+# Geçersiz il kodunu, görsel olarak yakın rakamlarla kurtarmayı deniyoruz.
+# Liste sırası = görsel benzerlik önceliği.
+RAKAM_ICI_KARISTIRMA = {
+    "8": ["3", "6", "9", "0"], "9": ["3", "8", "4"], "6": ["5", "8", "0"],
+    "5": ["6", "3"], "3": ["8", "9"], "0": ["8", "6"],
+    "1": ["7", "4"], "7": ["1", "2"], "4": ["1", "9"], "2": ["7", "1"],
+}
+# İl kodu kurtarma = TEK BİR rakam hatası. Bu yüzden cezası, sınıflar arası
+# zayıf bir düzeltmeyle (0.62) aynı seviyede tutulur.
+# 📊 Bu değer sahada ölçülerek düzeltildi: 0.45 iken '35 BPJ 875' plakası
+# yanlış okunuyordu. OCR parçaları doğruydu ('85' + 'BPJ' + '875'), sadece
+# il kodunun ilk hanesi 3 yerine 8 okunmuştu — TEK hata. Ama 0.45'lik ağır
+# ceza yüzünden çözümleyici İKİ hatalı bir yorumu tercih ediyordu:
+#     35BPJ875  (8->3 il düzeltmesi)                        -> 0.45
+#     58PJ875   (baştaki karakteri AT + 'B' harfini 8 san)  -> 0.62  ✗ kazanıyordu
+# Tek hatalı yorum, iki hatalıyı her zaman yenmelidir.
+CEZA_IL_KURTARMA = 0.62
+
+# 📏 KAPSAMA CEZASI: Çözümleyici, metin içindeki her 7 ve 8 karakterlik alt
+# diziyi dener. Sorun şu ki 8 karakterlik doğru bir plakanın ilk 7 karakteri de
+# çoğu zaman GEÇERLİ bir plakadır ('34CLY063' -> '34CLY06' = 34 + CLY + 06).
+# Hiç düzeltme gerektirmediği için eşit skor alır ve yanlışlıkla kazanır —
+# yani güvenle okunmuş bir karakter sessizce çöpe atılır. Atlanan her karakteri
+# cezalandırarak "tüm kanıtı kullanan" yorumu tercih ettiriyoruz.
+# Değer, HER TÜRLÜ tek karakter düzeltmesinden ağır olmalı: güvenle okunmuş
+# bir karakteri tamamen atmak, onu düzeltmekten daha büyük bir iddiadır.
+# (0.70 iken çok hafif kalıyordu — bkz. CEZA_IL_KURTARMA'daki 35BPJ875 vakası.)
+KAPSAMA_CEZASI = 0.55
+
+
+def _karakteri_uyarla(karakter: str, hedef: str) -> Tuple[Optional[str], float]:
+    """
+    Bir karakteri hedef sınıfa ('rakam' / 'harf') uyarlar.
+    (uyarlanmis_karakter, ceza_carpani) döner; uyarlanamıyorsa (None, 0.0).
+    Ceza 1.0 = hiç değişiklik gerekmedi.
+
+    Not: Harf ve rakam bloklarında birden fazla aday denenmez — orada seçimi
+    kısıtlayacak bir kural yoktur, en olası karşılık alınır. İl kodunda ise
+    geçerlilik kısıtı olduğu için tüm adaylar denenir (bkz. _il_kodu_coz).
+    """
+    if hedef == "rakam":
+        if karakter in RAKAMLAR:
+            return karakter, 1.0
+        alternatifler = RAKAMA_DONUSUM.get(karakter)
+    else:
+        if karakter in PLAKA_HARFLERI:
+            return karakter, 1.0
+        alternatifler = HARFE_DONUSUM.get(karakter)
+
+    if not alternatifler:
+        return None, 0.0
+    alternatif = alternatifler[0]
+    ceza = CEZA_GUCLU if (karakter, alternatif) in GUCLU_KARISTIRMA else CEZA_ZAYIF
+    return alternatif, ceza
+
+
+def _il_hane_adaylari(karakter: str) -> List[Tuple[str, float]]:
+    """Bir karakterin il kodu hanesi olarak alabileceği (rakam, ceza) adayları."""
+    adaylar = []
+    if karakter in RAKAMLAR:
+        adaylar.append((karakter, 1.0))
+        # Doğru sınıfta ama il kodunu geçersiz kılıyor olabilir — aynı sınıf
+        # görsel karıştırmalarını da (düşük güvenle) aday yap.
+        for sira, alternatif in enumerate(RAKAM_ICI_KARISTIRMA.get(karakter, [])):
+            adaylar.append((alternatif, CEZA_IL_KURTARMA if sira == 0
+                            else CEZA_IL_KURTARMA * 0.85))
+    else:
+        for alternatif in RAKAMA_DONUSUM.get(karakter, []):
+            ceza = CEZA_GUCLU if (karakter, alternatif) in GUCLU_KARISTIRMA else CEZA_ZAYIF
+            adaylar.append((alternatif, ceza))
+    return adaylar
+
+
+def _il_kodu_coz(iki_karakter: str) -> Tuple[Optional[str], float]:
+    """
+    İl kodunun tüm makul yorumlarını dener ve GEÇERLİ olanlar arasından
+    en az cezalı olanı seçer. (il_kodu, ceza) veya (None, 0.0).
+
+    Bu, çözümleyicinin en güçlü tarafı: 'B4' için hem '84' hem '34' üretilir,
+    ama sadece '34' gerçek bir il kodu olduğu için belirsizlik tek bir
+    kısıtla çözülür.
+    """
+    en_iyi, en_ceza = None, 0.0
+    for hane1, ceza1 in _il_hane_adaylari(iki_karakter[0]):
+        for hane2, ceza2 in _il_hane_adaylari(iki_karakter[1]):
+            kod = hane1 + hane2
+            if kod not in IL_KODLARI:
+                continue
+            ceza = ceza1 * ceza2
+            if ceza > en_ceza:
+                en_ceza, en_iyi = ceza, kod
+    return en_iyi, en_ceza
+
+
+# İl kodundan sonra izin verilen (harf sayısı -> geçerli rakam sayıları)
+BLOK_SEMALARI = {1: (4, 5), 2: (3, 4), 3: (2, 3)}
+
+
+def plaka_cozumle(ham_metin: str, taban_guven: float) -> Tuple[Optional[str], float]:
+    """
+    Ham OCR metnini Türk plaka dilbilgisine göre çözümler.
+
+    Metin içindeki 7 ve 8 karakterlik tüm alt dizileri, tüm olası
+    (il kodu | harf bloğu | rakam bloğu) bölünmeleriyle dener; karakterleri
+    konumlarının gerektirdiği sınıfa uyarlar ve en yüksek skorlu yorumu döner.
+
+    Skor = taban_guven × (uyarlama cezalarının geometrik ortalaması)
+    Hiç düzeltme gerekmeyen bir okuma, düzeltilmiş bir okumayı hep yener.
+    """
+    if not ham_metin or len(ham_metin) < 7:
+        return None, 0.0
+
+    en_iyi_plaka, en_iyi_skor = None, 0.0
+    # Eşit skorda DAHA UZUN yorum kazansın diye karşılaştırma anahtarı
+    # (skor, uzunluk) ikilisi; böylece '34CLY063' ile '34CLY06' berabere
+    # kaldığında tüm kanıtı kullanan uzun olan seçilir.
+    en_iyi_anahtar = (0.0, 0)
+    n = len(ham_metin)
+
+    for uzunluk in (8, 7):
+        if n < uzunluk:
+            continue
+        # Alt dizi kullanıldığında atlanan karakter sayısı kadar ceza
+        kapsama = KAPSAMA_CEZASI ** (n - uzunluk)
+
+        for basla in range(n - uzunluk + 1):
+            parca = ham_metin[basla:basla + uzunluk]
+
+            for harf_sayisi, gecerli_rakamlar in BLOK_SEMALARI.items():
+                rakam_sayisi = uzunluk - 2 - harf_sayisi
+                if rakam_sayisi not in gecerli_rakamlar:
+                    continue
+
+                cozulmus, cezalar, basarili = [], [], True
+
+                # 1) İl kodu — 2 rakam.
+                # 🔑 KISIT: il kodu gerçekten var olmalı (01-81).
+                # Belirsiz karakterleri çözen asıl bilgi bu.
+                il_kodu, il_cezasi = _il_kodu_coz(parca[:2])
+                if il_kodu is None:
+                    continue
+                cozulmus.extend(il_kodu)
+                cezalar.append(il_cezasi)
+
+                # 2) Harf bloğu
+                for i in range(2, 2 + harf_sayisi):
+                    ch, ceza = _karakteri_uyarla(parca[i], "harf")
+                    if ch is None:
+                        basarili = False
+                        break
+                    cozulmus.append(ch)
+                    cezalar.append(ceza)
+                if not basarili:
+                    continue
+
+                # 3) Rakam bloğu
+                for i in range(2 + harf_sayisi, uzunluk):
+                    ch, ceza = _karakteri_uyarla(parca[i], "rakam")
+                    if ch is None:
+                        basarili = False
+                        break
+                    cozulmus.append(ch)
+                    cezalar.append(ceza)
+                if not basarili:
+                    continue
+
+                # Cezalar DOĞRUDAN çarpılır (geometrik ortalama alınmaz):
+                # 8 karakterlik bir dizide geometrik ortalama, tek bir kötü
+                # uyarlamayı görünmez hale getirirdi (0.62^(1/8) ≈ 0.94).
+                carpim = kapsama
+                for c in cezalar:
+                    carpim *= c
+                skor = taban_guven * carpim
+
+                anahtar = (round(skor, 6), uzunluk)
+                if anahtar > en_iyi_anahtar:
+                    en_iyi_anahtar = anahtar
+                    en_iyi_skor = skor
+                    en_iyi_plaka = "".join(cozulmus)
+
+    return en_iyi_plaka, en_iyi_skor
+
+
+def plaka_format_gecerli_mi(plaka: str) -> bool:
+    """Metin, düzeltmeye gerek kalmadan geçerli bir TR plakası mı?"""
+    if not plaka or len(plaka) not in (7, 8):
+        return False
+    if plaka[:2] not in IL_KODLARI:
+        return False
+    govde = plaka[2:]
+    for harf_sayisi, gecerli_rakamlar in BLOK_SEMALARI.items():
+        rakam_sayisi = len(govde) - harf_sayisi
+        if rakam_sayisi not in gecerli_rakamlar:
+            continue
+        harfler, rakamlar = govde[:harf_sayisi], govde[harf_sayisi:]
+        if all(c in PLAKA_HARFLERI for c in harfler) and all(c in RAKAMLAR for c in rakamlar):
+            return True
+    return False
+
+
+def plaka_temizle(text: str) -> str:
+    """OCR metnini normalize eder: büyük harf, Türkçe->Latin, sadece A-Z0-9."""
+    text = (text or "").upper().replace(" ", "").strip()
+    text = text.translate(str.maketrans("İIÖÜÇŞĞ", "IIOUCSG"))
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
+# 🇹🇷 Plakanın solundaki mavi TR bandı OCR tarafından 'TR', 'T', '7R', 'TRI'
+# gibi okunuyor ve birleştirilmiş metnin başına yapışıyor. Bunları atıyoruz.
+TR_BANDI_DESENLERI = {"TR", "T", "TRI", "7R", "IR", "R", "TF", "1R", "TP"}
+
+
+# ==========================================================================
+# 🚫 SABİT TABELA KARA LİSTESİ (sadece ELLE yönetilen, tam eşleşme)
+# ==========================================================================
+# ⚠️ ÖNEMLİ MİMARİ DEĞİŞİKLİK — "kendi kendine öğrenen kara liste" KALDIRILDI.
+#
+# Eski mekanizma: OCR'ın okuduğu, tek başına geçerli plaka olmayan her parça
+# (>=4 karakter, harf içeren) aday sayılıyor; 3 farklı araçta tekrar ederse
+# otomatik kara listeye giriyordu. Sorun şu ki plaka PARÇALARI tam olarak bu
+# tanıma uyuyor: '34CLY' tek başına geçerli plaka değil, 'CLY063' de değil.
+# Sistem sahadaki gerçek plakaların parçalarını öğrenip yasakladı. Diskteki
+# dosya bunu kanıtlıyordu:
+#     ["502P","5302P","ABS389","B4CLY","B4LLY","BH3152","CLY063","HJ8583","HRP250"]
+# Buradaki 'CLY063', gerçek '34 CLY 063' plakasının kendisi.
+#
+# Üstüne, eşleştirme çift yönlü substring yapıyordu
+# ('063' in 'CLY063' -> True) — yani '063' parçası da eleniyordu. Sonuç:
+# sistem doğru okuduğu plakayı kendi eliyle çöpe atıp yerine uydurma bir
+# sonuç üretiyordu. Bu mekanizma tamamen silindi.
+#
+# Sabit tabela/çıkartma sorunu artık DAHA DOĞRU bir yerden çözülüyor:
+# plaka sadece hareket eden bir ARACIN kutusu içinde aranıyor (PLAKA_ARAC_ZORUNLU).
+# Sabit tabela bir aracın üstünde olmadığı için aday bile olamıyor.
+#
+# Aşağıdaki liste yalnızca ELLE yönetilir ve TAM EŞLEŞME ile çalışır;
+# substring eşleşmesi bilerek kullanılmıyor.
+KARA_LISTE_DOSYASI = os.path.join(os.path.dirname(RETRAIN_DIR), "kara_liste.json")
+
+
+def kara_listeyi_yukle() -> set:
+    if os.path.exists(KARA_LISTE_DOSYASI):
+        try:
+            with open(KARA_LISTE_DOSYASI, "r", encoding="utf-8") as f:
+                return set(json.load(f).get("kelimeler", []))
+        except Exception as e:
+            log(f"⚠️ Kara liste okunamadı, boş başlatılıyor: {e}", "uyari")
+    return set()
+
+
+def kara_listeyi_kaydet():
+    try:
+        with open(KARA_LISTE_DOSYASI, "w", encoding="utf-8") as f:
+            json.dump({"kelimeler": sorted(KARA_LISTE)}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"⚠️ Kara liste diske kaydedilemedi: {e}", "uyari")
+
+
+KARA_LISTE = kara_listeyi_yukle()
+log(f"🚫 Kara liste yüklendi: {len(KARA_LISTE)} elle tanımlı kelime (otomatik öğrenme KAPALI).")
+
+
+# ==========================================================================
+# 🧠 DÜZELTME HAFIZASI (güvenlik görevlisinin düzeltmeleri)
+# ==========================================================================
 DUZELTME_HAFIZASI_YOLU = os.path.join(os.path.dirname(RETRAIN_DIR), "duzeltme_hafizasi.json")
 
 
-def duzeltme_hafizasini_yukle():
+def duzeltme_hafizasini_yukle() -> dict:
     if os.path.exists(DUZELTME_HAFIZASI_YOLU):
         try:
             with open(DUZELTME_HAFIZASI_YOLU, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.warning(f"⚠️ Düzeltme hafızası okunamadı, boş başlatılıyor: {e}")
+            log(f"⚠️ Düzeltme hafızası okunamadı: {e}", "uyari")
     return {}
 
 
@@ -236,503 +663,1081 @@ def duzeltme_hafizasini_kaydet(hafiza: dict):
         with open(DUZELTME_HAFIZASI_YOLU, "w", encoding="utf-8") as f:
             json.dump(hafiza, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f"⚠️ Düzeltme hafızası diske kaydedilemedi: {e}")
+        log(f"⚠️ Düzeltme hafızası kaydedilemedi: {e}", "uyari")
 
 
 DUZELTME_HAFIZASI = duzeltme_hafizasini_yukle()
-logger.info(f"🧠 Düzeltme hafızası yüklendi: {len(DUZELTME_HAFIZASI)} kayıtlı düzeltme mevcut.")
+log(f"🧠 Düzeltme hafızası yüklendi: {len(DUZELTME_HAFIZASI)} kayıt.")
 
 
 def levenshtein_mesafesi(a: str, b: str) -> int:
-    """ İki string arasındaki düzenleme (edit distance) mesafesini hesaplar """
     if a == b:
         return 0
-    if len(a) == 0:
+    if not a:
         return len(b)
-    if len(b) == 0:
+    if not b:
         return len(a)
-
-    onceki_satir = list(range(len(b) + 1))
-    for i, karakter_a in enumerate(a, start=1):
-        simdiki_satir = [i] + [0] * len(b)
-        for j, karakter_b in enumerate(b, start=1):
-            ekleme = onceki_satir[j] + 1
-            silme = simdiki_satir[j - 1] + 1
-            degistirme = onceki_satir[j - 1] + (karakter_a != karakter_b)
-            simdiki_satir[j] = min(ekleme, silme, degistirme)
-        onceki_satir = simdiki_satir
-    return onceki_satir[-1]
+    onceki = list(range(len(b) + 1))
+    for i, ka in enumerate(a, start=1):
+        simdiki = [i] + [0] * len(b)
+        for j, kb in enumerate(b, start=1):
+            simdiki[j] = min(onceki[j] + 1, simdiki[j - 1] + 1, onceki[j - 1] + (ka != kb))
+        onceki = simdiki
+    return onceki[-1]
 
 
-def hafizadan_duzelt(plaka: str, esik_mesafe: int = 2):
-    """
-    OCR'dan gelen plakayı, daha önce yapılmış düzeltmelerle karşılaştırır. Tam
-    eşleşme varsa direkt, yakın eşleşme varsa (edit distance <= esik_mesafe, aynı
-    uzunlukta) en yakın olanı döner. Eşleşme yoksa plakayı olduğu gibi döner.
-    """
+def hafizadan_duzelt(plaka: str, esik_mesafe: int = 2) -> Tuple[str, bool]:
+    """Geçmişte elle düzeltilmiş bir okumaya tam/yakın eşleşme arar."""
     if plaka in DUZELTME_HAFIZASI:
         return DUZELTME_HAFIZASI[plaka], True
-
-    en_yakin_dogru, en_yakin_mesafe = None, esik_mesafe + 1
+    en_yakin, en_yakin_mesafe = None, esik_mesafe + 1
     for yanlis, dogru in DUZELTME_HAFIZASI.items():
         if len(yanlis) != len(plaka):
             continue
         mesafe = levenshtein_mesafesi(plaka, yanlis)
         if mesafe < en_yakin_mesafe:
-            en_yakin_mesafe = mesafe
-            en_yakin_dogru = dogru
+            en_yakin_mesafe, en_yakin = mesafe, dogru
+    return (en_yakin, True) if en_yakin else (plaka, False)
 
-    if en_yakin_dogru is not None:
-        return en_yakin_dogru, True
 
-    return plaka, False
+# ==========================================================================
+# 📷 GÖRÜNTÜ İŞLEME
+# ==========================================================================
 
-# --- 🎯 TÜRK PLAKA FORMAT DOĞRULAMA ---
-# Türk plakalarında Q, W, X harfleri kullanılmaz
-IL_KODU = r'(0[1-9]|[1-7][0-9]|8[01])'
-PLAKA_PATTERNS = [
-    re.compile(rf'^{IL_KODU}[A-PR-VYZ]{{1}}[0-9]{{4,5}}$'),   # 34A1234 / 34A12345
-    re.compile(rf'^{IL_KODU}[A-PR-VYZ]{{2}}[0-9]{{3,4}}$'),   # 34AB123 / 34AB1234
-    re.compile(rf'^{IL_KODU}[A-PR-VYZ]{{3}}[0-9]{{2,3}}$'),   # 34ABC12 / 34ABC123
-]
-
-EASYOCR_ALLOWLIST = "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
-
-# --- 🚫 SABİT TABELA / FİLİGRAN KARA LİSTESİ ---
-# Kameranın sabit gördüğü, plaka OLMAYAN ama OCR'ın yüksek güvenle okuduğu metinler
-# (kamera üstü "GEBZE GİRİŞ/ÇIKIŞ", kamyon üstü "ANGLES MORTS" uyarısı, firma yazıları).
-YASAKLI_KELIMELER = {
-    "GEBZE", "GIRIS", "CIKIS", "ANGLES", "MORTS", "ANGLESMORTS",
-    "CARGO", "B2CARGO", "DEPO", "KAMERA", "WAREHOUSE", "WATERMARK",
-}
-
-
-def yasakli_metin_mi(temiz_text: str) -> bool:
-    """
-    Temizlenmiş bir OCR parçasının, bilinen sabit tabela/filigran kara listesiyle
-    (elle girilmiş VEYA kendiliğinden öğrenilmiş) eşleşip eşleşmediğini kontrol eder.
-    Hem tam hem kısmi (substring) eşleşmeyi yakalar.
-    """
-    if not temiz_text or len(temiz_text) < 3:
-        return False
-    tum_yasakli = YASAKLI_KELIMELER | OTO_YASAKLI_KELIMELER
-    for kelime in tum_yasakli:
-        if kelime in temiz_text or temiz_text in kelime:
-            return True
-    return False
-
-
-# --- 🧠 KENDİ KENDİNE ÖĞRENEN KARA LİSTE ---
-# Plaka formatına asla uymayan ama FARKLI araç geçişlerinde tekrar eden metin
-# parçaları (sabit tabela/çıkartma) eşiği aşınca otomatik kara listeye alınır.
-OTO_KARA_LISTE_DOSYASI = os.path.join(os.path.dirname(RETRAIN_DIR), "oto_kara_listesi.json")
-OTO_KARA_LISTE_ESIK = int(os.getenv("OTO_KARA_LISTE_ESIK", "3"))  # kaç FARKLI araçta görülünce eklensin
-
-
-def oto_kara_listesini_yukle():
-    if os.path.exists(OTO_KARA_LISTE_DOSYASI):
-        try:
-            with open(OTO_KARA_LISTE_DOSYASI, "r", encoding="utf-8") as f:
-                veri = json.load(f)
-                return set(veri.get("kelimeler", [])), veri.get("sayaclar", {})
-        except Exception as e:
-            logger.warning(f"⚠️ Otomatik kara liste okunamadı, boş başlatılıyor: {e}")
-    return set(), {}
-
-
-def oto_kara_listesini_kaydet():
-    try:
-        with open(OTO_KARA_LISTE_DOSYASI, "w", encoding="utf-8") as f:
-            json.dump(
-                {"kelimeler": sorted(OTO_YASAKLI_KELIMELER), "sayaclar": OTO_KELIME_SAYAC},
-                f, ensure_ascii=False, indent=2
-            )
-    except Exception as e:
-        logger.warning(f"⚠️ Otomatik kara liste diske kaydedilemedi: {e}")
-
-
-OTO_YASAKLI_KELIMELER, OTO_KELIME_SAYAC = oto_kara_listesini_yukle()
-logger.info(f"🧠 Otomatik kara liste yüklendi: {len(OTO_YASAKLI_KELIMELER)} öğrenilmiş kelime, {len(OTO_KELIME_SAYAC)} takip edilen aday.")
-
-
-def episode_junk_kelimelerini_degerlendir(bu_episode_kelimeleri: set):
-    """
-    Bir araç episode'u bitince çağrılır. O episode'da görülen ama plaka formatına
-    uymayan benzersiz parçaların sayacını +1 artırır (aynı episode'da defalarca
-    görülse bile +1). Eşiği aşan kelime otomatik kara listeye alınır ve diske yazılır.
-    """
-    global OTO_YASAKLI_KELIMELER, OTO_KELIME_SAYAC
-    degisiklik_oldu = False
-    for kelime in bu_episode_kelimeleri:
-        if kelime in YASAKLI_KELIMELER or kelime in OTO_YASAKLI_KELIMELER:
-            continue
-        OTO_KELIME_SAYAC[kelime] = OTO_KELIME_SAYAC.get(kelime, 0) + 1
-        degisiklik_oldu = True
-        if OTO_KELIME_SAYAC[kelime] >= OTO_KARA_LISTE_ESIK:
-            OTO_YASAKLI_KELIMELER.add(kelime)
-            logger.info(f"🧠 [OTOMATİK KARA LİSTE] '{kelime}' {OTO_KELIME_SAYAC[kelime]} farklı araç geçişinde tekrar etti — otomatik olarak kara listeye eklendi.")
-    if degisiklik_oldu:
-        oto_kara_listesini_kaydet()
-
-
-def plaka_format_gecerli_mi(plaka: str) -> bool:
-    """ Metnin standart Türk plaka formatına uyup uymadığını kontrol eder """
-    return any(p.match(plaka) for p in PLAKA_PATTERNS)
-
-
-def plaka_temizle(text):
-    """ EasyOCR'dan gelen metni temizler, sadece A-Z0-9 bırakır """
-    text = text.upper().replace(" ", "").strip()
-    # Türkçe karakter -> Latin karşılığı (OCR bazen İ/Ö/Ü gibi okuyabiliyor)
-    tr_map = str.maketrans("İIÖÜÇŞĞ", "IIOUCSG")
-    text = text.translate(tr_map)
-    cleaned = re.sub(r'[^A-Z0-9]', '', text)
-    return cleaned
-
-def parcalari_plaka_olarak_birlestir(ocr_results):
-    """
-    EasyOCR parçalarını (bbox, text, prob) x-koordinatına göre soldan sağa sıralar,
-    ardışık alt-dizileri dener ve geçerli TR plaka formatına uyan, en yüksek ortalama
-    güvene sahip kombinasyonu döner. Yoksa (None, 0.0).
-
-    Y-EKSENİ TUTARLILIK KONTROLÜ: Farklı bir satırda duran metin x'te çakışabilir ama
-    y'de belirgin farklı yükseklikte olur; bu yüzden zincire eklemeden önce dikey
-    merkez farkını kontrol ediyoruz.
-    """
-    parcalar = []
-    for bbox, text, prob in ocr_results:
-        # 📊 Çok düşük güven parçaları hemen atla
-        if prob < 0.25:  # %25'ten az güven = çöp (False positive)
-            continue
-
-        temiz = plaka_temizle(text)
-        if not temiz:
-            continue
-        if yasakli_metin_mi(temiz):
-            logger.debug(f"   🚫 [Kara Liste] '{temiz}' parçası elendi (plaka olamayacak sabit metin).")
-            continue
-
-        # bbox 4 nokta: [ [x1,y1], [x2,y2], [x3,y3], [x4,y4] ]
-        x_min = min(nokta[0] for nokta in bbox)
-        y_coords = [nokta[1] for nokta in bbox]
-        y_min, y_max = min(y_coords), max(y_coords)
-        y_center = (y_min + y_max) / 2
-        yukseklik = max(y_max - y_min, 1)  # 0'a bölünmeyi önlemek için min 1
-
-        parcalar.append({
-            "text": temiz, "prob": prob, "x": x_min,
-            "y_center": y_center, "yukseklik": yukseklik
-        })
-
-    parcalar.sort(key=lambda p: p["x"])
-    n = len(parcalar)
-    adaylar = []
-
-    # 🔧 Aynı satırda sayılabilmek için: iki parçanın y_center farkı,
-    # ikisinin ortalama yüksekliğinin şu katsayısını aşmamalı.
-    Y_TUTARLILIK_KATSAYISI = 0.6
-
-    for i in range(n):
-        birlesik, problar = "", []
-        onceki_parca = None
-
-        for j in range(i, n):
-            simdiki_parca = parcalar[j]
-
-            if onceki_parca is not None:
-                y_farki = abs(simdiki_parca["y_center"] - onceki_parca["y_center"])
-                ort_yukseklik = (simdiki_parca["yukseklik"] + onceki_parca["yukseklik"]) / 2
-                if y_farki > ort_yukseklik * Y_TUTARLILIK_KATSAYISI:
-                    # Bu parça farklı bir satırda/yükseklikte — zinciri burada kes
-                    break
-
-            birlesik += simdiki_parca["text"]
-            problar.append(simdiki_parca["prob"])
-            onceki_parca = simdiki_parca
-
-            if plaka_format_gecerli_mi(birlesik):
-                adaylar.append((birlesik, sum(problar) / len(problar)))
-
-                # 🔄 ALTERNATIF PLAKALARI DENE: 1↔I, 0↔O vb. (OCR karıştırması çok yaygın)
-                for katiksiz, katikli in [("1", "I"), ("I", "1"), ("0", "O"), ("O", "0")]:
-                    alternatif = birlesik.replace(katiksiz, katikli)
-                    if alternatif != birlesik and plaka_format_gecerli_mi(alternatif):
-                        adaylar.append((alternatif, sum(problar) / len(problar) * 0.95))  # Düşük güven, alternatif olduğu için
-
-    if not adaylar:
-        return None, 0.0
-
-    adaylar.sort(key=lambda x: x[1], reverse=True)
-    return adaylar[0]
-
-
-def esnek_plaka_ara(ocr_results):
-    """
-    🩹 FALLBACK EŞLEŞTİRİCİ: Katı zincirleme (parcalari_plaka_olarak_birlestir) y
-    ekseninde uyumsuz tek bir bozuk parça yüzünden komşu doğru parçaları
-    birleştiremeyebiliyor. Bu fonksiyon TÜM parçaları (y kontrolü YAPMADAN) x'e göre
-    yapıştırır ve içinde geçerli bir TR plaka alt-dizisi arar. Daha toleranslı ama
-    yanlış pozitif riski yüksek olduğu için SADECE katı yöntem sonuç veremezse ve
-    düşürülmüş güvenle kullanılır.
-    """
-    parcalar = []
-    for bbox, text, prob in ocr_results:
-        if prob < 0.20:
-            continue
-        temiz = plaka_temizle(text)
-        if not temiz or yasakli_metin_mi(temiz):
-            continue
-        x_min = min(nokta[0] for nokta in bbox)
-        parcalar.append((x_min, temiz, prob))
-
-    if not parcalar:
-        return None, 0.0
-
-    parcalar.sort(key=lambda p: p[0])
-    birlesik = "".join(p[1] for p in parcalar)
-    ortalama_guven = sum(p[2] for p in parcalar) / len(parcalar)
-
-    # Türk plakaları 7 ya da 8 karakter uzunluğunda (il kodu + harf + rakam)
-    for uzunluk in (8, 7):
-        for basla in range(0, max(0, len(birlesik) - uzunluk + 1)):
-            aday = birlesik[basla:basla + uzunluk]
-            if plaka_format_gecerli_mi(aday):
-                # Fallback olduğu için güveni %85'e çarpıyoruz
-                return aday, ortalama_guven * 0.85
-
-    return None, 0.0
-
-
-def plakayi_izole_et(crop_bgr):
-    """
-    YOLO'nun geniş kestiği alandan gerçek plaka dikdörtgenini bulup daha sıkı kırpar.
-    Bulunamazsa orijinal crop'u fallback olarak döner.
-    """
-    if crop_bgr is None or crop_bgr.size == 0:
-        return crop_bgr
-
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 11, 17, 17)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    konturlar, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    h_crop, w_crop = gray.shape[:2]
-    en_iyi_kontur, en_iyi_skor = None, 0
-
-    for kontur in konturlar:
-        x, y, w, h = cv2.boundingRect(kontur)
-        if w < 40 or h < 12:
-            continue
-        aspect = w / float(h)
-        alan_orani = (w * h) / float(w_crop * h_crop)
-
-        if 3.5 <= aspect <= 6.0 and 0.15 <= alan_orani <= 0.95:
-            if alan_orani > en_iyi_skor:
-                en_iyi_skor = alan_orani
-                en_iyi_kontur = (x, y, w, h)
-
-    if en_iyi_kontur is not None:
-        x, y, w, h = en_iyi_kontur
-        pad = 10  # 📐 Daha geniş padding (hareketi olan araçlar için)
-        y1, y2 = max(0, y - pad), min(h_crop, y + h + pad)
-        x1, x2 = max(0, x - pad), min(w_crop, x + w + pad)
-        izole = crop_bgr[y1:y2, x1:x2]
-        if izole.size > 0:
-            return izole
-
-    return crop_bgr  # kontur bulunamadıysa orijinali dön
-
-
-def on_isleme_varyantlari(crop_bgr):
-    """
-    Tek bir sert (global OTSU) binarizasyon yerine, farklı ışık/kontrast koşullarına
-    dayanıklı birden fazla varyant üretir (EasyOCR'a sırayla denenir).
-    """
-    resized = cv2.resize(crop_bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-
-    varyantlar = []
-
-    # 1) CLAHE ile kontrast güçlendirilmiş gri görsel (binarizasyon YOK)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    clahe_gray = clahe.apply(gray)
-    varyantlar.append(clahe_gray)
-
-    # 2) Adaptif (bölgesel) eşikleme — gölge/parlama farklılıklarına yerel uyum
-    adaptif = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10
-    )
-    varyantlar.append(adaptif)
-
-    # 3) Global OTSU (eski yöntem) — bazı temiz, düz ışıklı karelerde hâlâ en iyisi
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    varyantlar.append(otsu)
-
-    # 4) Unsharp mask (keskinleştirme) + CLAHE — 3x büyütmedeki bulanıklığı telafi
-    bulanik = cv2.GaussianBlur(clahe_gray, (0, 0), sigmaX=2.0)
-    keskin = cv2.addWeighted(clahe_gray, 1.6, bulanik, -0.6, 0)
-    varyantlar.append(keskin)
-
-    return varyantlar
-
-
-def kareyi_oku(best_crop):
-    """
-    Bir plaka karesini izole eder, birden fazla ön-işleme varyantıyla OCR dener ve
-    en yüksek ortalama güvene sahip, formatı doğrulanmış plakayı döner. Hiçbiri
-    geçerli değilse (None, 0.0, []) döner.
-    """
-    if best_crop is None or best_crop.size == 0:
-        logger.warning("   ⚠️ [Teşhis] Gelen kare boş/None — YOLO kutusu geçersiz olabilir.")
-        return None, 0.0, []
-
-    h, w = best_crop.shape[:2]
-    if w < 15 or h < 8:
-        logger.warning(f"   ⚠️ [Teşhis] Kare çok küçük ({w}x{h}px) — OCR için yetersiz çözünürlük.")
-
-    # 📷 PREPROCESSING: Contrast artır, noise azalt, resize yap
-    best_crop = plaka_ocr_preprocessing(best_crop)
-
-    izole_edilmis = plakayi_izole_et(best_crop)
-    varyantlar = on_isleme_varyantlari(izole_edilmis)
-
-    en_iyi_plaka, en_iyi_guven = None, 0.0
-    tum_ham_parcalar = []
-
-    for v_idx, varyant in enumerate(varyantlar):
-        # 🧵 EasyOCR çıkarımı da tek kilit altında (çok kameralı thread güvenliği)
-        with INFERENCE_LOCK:
-            ocr_results = reader.readtext(varyant, allowlist=EASYOCR_ALLOWLIST)
-
-        if not ocr_results:
-            continue
-
-        for (bbox, text, prob) in ocr_results:
-            tum_ham_parcalar.append((v_idx, text, prob))
-
-        plaka, ortalama_guven = parcalari_plaka_olarak_birlestir(ocr_results)
-
-        # 🩹 Katı zincirleme sonuç veremediyse toleranslı fallback'i dene
-        if plaka is None:
-            plaka, ortalama_guven = esnek_plaka_ara(ocr_results)
-            if plaka is not None:
-                logger.info(f"   🩹 [Esnek Eşleştirme] Katı zincirleme başarısız oldu ama fallback bir aday buldu: '{plaka}' (Güven: {ortalama_guven:.2f})")
-
-        if plaka is not None and ortalama_guven > en_iyi_guven:
-            en_iyi_plaka, en_iyi_guven = plaka, ortalama_guven
-
-    return en_iyi_plaka, en_iyi_guven, tum_ham_parcalar
-
-
-def keskinlik_skoru(gorsel_bgr):
-    """ Laplacian varyansı ile görüntü netliğini ölçer (yüksek = daha net) """
+def keskinlik_skoru(gorsel_bgr) -> float:
+    """Laplacian varyansı ile netlik ölçer (yüksek = daha net)."""
     try:
         gray = cv2.cvtColor(gorsel_bgr, cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
     except Exception:
         return 0.0
 
 
-def oylama_ile_konsensus(adaylar):
-    if not adaylar:
-        return None, 0.0
-
-    uzunluk_gruplari = {}
-    for plaka, guven in adaylar:
-        uzunluk_gruplari.setdefault(len(plaka), []).append((plaka, guven))
-
-    en_iyi_uzunluk = max(uzunluk_gruplari, key=lambda L: sum(g for _, g in uzunluk_gruplari[L]))
-    grup = uzunluk_gruplari[en_iyi_uzunluk]
-
-    # 🔑 Tek aday varsa oylamaya girmeden direkt onu dön (sahte 1.0 güven üretmesin)
-    if len(grup) == 1:
-        return grup[0]
-
-    konsensus_karakterler = []
-    pozisyon_guvenleri = []
-    for pos in range(en_iyi_uzunluk):
-        oy_agirliklari = {}
-        for plaka, guven in grup:
-            karakter = plaka[pos]
-            oy_agirliklari[karakter] = oy_agirliklari.get(karakter, 0.0) + guven
-        en_iyi_karakter = max(oy_agirliklari, key=oy_agirliklari.get)
-        konsensus_karakterler.append(en_iyi_karakter)
-        toplam_agirlik = sum(oy_agirliklari.values())
-        pozisyon_guveni = oy_agirliklari[en_iyi_karakter] / toplam_agirlik if toplam_agirlik > 0 else 0.0
-        pozisyon_guvenleri.append(pozisyon_guveni)
-
-    konsensus_plaka = "".join(konsensus_karakterler)
-    # Konsensüs güvenini, oy sayısından bağımsız gerçek ortalamayla harmanla
-    ham_ortalama = sum(g for _, g in grup) / len(grup)
-    konsensus_guven = (sum(pozisyon_guvenleri) / len(pozisyon_guvenleri)) * 0.5 + ham_ortalama * 0.5
-
-    if not plaka_format_gecerli_mi(konsensus_plaka):
-        grup_sirali = sorted(grup, key=lambda x: x[1], reverse=True)
-        return grup_sirali[0]
-
-    return konsensus_plaka, konsensus_guven
-
-
-def kutu_ortusme_orani(kutu_a, kutu_b):
-    """ İki (x1,y1,x2,y2) kutusu arasındaki IoU (kesişim/birleşim) oranını hesaplar """
-    ax1, ay1, ax2, ay2 = kutu_a
-    bx1, by1, bx2, by2 = kutu_b
-
-    kesisim_x1, kesisim_y1 = max(ax1, bx1), max(ay1, by1)
-    kesisim_x2, kesisim_y2 = min(ax2, bx2), min(ay2, by2)
-
-    kesisim_w = max(0, kesisim_x2 - kesisim_x1)
-    kesisim_h = max(0, kesisim_y2 - kesisim_y1)
-    kesisim_alan = kesisim_w * kesisim_h
-
-    a_alan = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    b_alan = max(0, bx2 - bx1) * max(0, by2 - by1)
-    birlesim_alan = a_alan + b_alan - kesisim_alan
-
-    if birlesim_alan <= 0:
-        return 0.0
-    return kesisim_alan / birlesim_alan
-
-
-def gorseli_base64_kodla(gorsel_bgr, jpeg_kalite: int = 85):
+def plaka_bandini_daralt(crop_bgr):
     """
-    Bir OpenCV (BGR, numpy) görselini JPEG'e sıkıştırıp base64 string'e çevirir.
-    Encode başarısız olursa None döner (gönderimi engellemesin diye exception fırlatmaz).
+    YOLO'nun plaka kutusu, plakanın kendisinden belirgin şekilde YÜKSEK olur —
+    plaka yuvasının gölgesini, tamponun bir kısmını da içine alır (sahadaki
+    ölçüm: gerçek plaka 3.9:1 iken YOLO kutusu 2.3:1). Bu fazlalık alan OCR'ı
+    yanıltıyor ve normalizasyonu bozuyor.
+
+    Karakterlerin bulunduğu yatay bandı, satır bazlı DİKEY KENAR ENERJİSİNE
+    bakarak buluyoruz: karakter satırları bol dikey kenar üretir, düz tampon
+    yüzeyi üretmez. Bant güvenilir bulunamazsa orijinal crop aynen döner
+    (yani bu adım asla veri kaybettirmez).
     """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return crop_bgr
+    h, w = crop_bgr.shape[:2]
+    if h < 20 or w < 40:
+        return crop_bgr
+
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    sobel = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    satir_enerjisi = sobel.sum(axis=1)
+    if satir_enerjisi.max() <= 0:
+        return crop_bgr
+
+    esik = satir_enerjisi.max() * 0.35
+    aktif = np.where(satir_enerjisi >= esik)[0]
+    if aktif.size < 4:
+        return crop_bgr
+
+    y1, y2 = int(aktif[0]), int(aktif[-1])
+    bant_yuksekligi = y2 - y1
+    # Bant, kutunun çok küçük bir dilimiyse ölçüm güvenilmezdir
+    if bant_yuksekligi < h * 0.20:
+        return crop_bgr
+
+    pay = int(bant_yuksekligi * 0.22) + 2
+    y1 = max(0, y1 - pay)
+    y2 = min(h, y2 + pay)
+    daraltilmis = crop_bgr[y1:y2, :]
+    return daraltilmis if daraltilmis.size > 0 else crop_bgr
+
+
+# 📏 ÖLÇEK — doğruluğu belirleyen TEK EN ÖNEMLİ parametre.
+# Kırpmayı sabit bir çarpanla değil HEDEF YÜKSEKLİĞE normalize ediyoruz:
+# uzaktaki küçük bir plaka da, yakındaki büyük bir plaka da OCR'a aynı
+# ölçekte gider.
+#
+# 📊 Değer, yer gerçeği BİLİNEN 4 araç (41 kare) üzerinde tarandı.
+# Sahada giriş kamerası '41' plakalarını ısrarla '61' okuyordu; sebebi
+# yetersiz büyütmeymiş:
+#       hedef 230 -> %29 kare doğruluğu   (41ALA927 ve 41ATK278 YANLIŞ)
+#       hedef 380 -> %63
+#       hedef 460 -> %71
+#       hedef 620 -> %88  ✅ dördü de doğru  <-- seçilen
+#       hedef 700 -> %73  (aşırı büyütme artefaktı başlıyor)
+#       hedef 900 -> %71  (büyük kırpmalı K2 vakası bile bozuluyor)
+# Tepe noktası 620; ötesinde interpolasyon karakterleri bozmaya başlıyor.
+HEDEF_PLAKA_YUKSEKLIGI = int(os.getenv("HEDEF_PLAKA_YUKSEKLIGI", "620"))
+# Küçük kırpmalarda hedefe ulaşmak 8x'i bulabiliyor (74px -> 620px);
+# tavan bunu engellememeli.
+AZAMI_OLCEK = float(os.getenv("AZAMI_OLCEK", "10.0"))
+
+
+def _hedef_boyuta_olcekle(bgr):
+    """Kırpmayı hedef yüksekliğe büyütür ve griye çevirir. Asla küçültmez."""
+    h, w = bgr.shape[:2]
+    olcek = max(1.0, min(HEDEF_PLAKA_YUKSEKLIGI / float(h), AZAMI_OLCEK))
+    if olcek > 1.01:
+        bgr = cv2.resize(bgr, (int(w * olcek), int(h * olcek)),
+                         interpolation=cv2.INTER_CUBIC)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+
+def plaka_egimini_duzelt(crop_bgr):
+    """
+    Plakanın eğimini bulup düzeltir (deskew). Bulunamazsa None.
+
+    📊 NEDEN: Sahadaki hataların ezici çoğunluğu İL KODUNDA yoğunlaşıyordu
+    (34↔14↔61↔04↔81); gövde neredeyse her zaman doğru okunuyordu. Sebebi
+    şu: kamera plakaya açıyla baktığı için perspektif SOL kenarı sıkıştırıyor
+    ve il kodu tam orada duruyor. Eğim düzeltilince o sıkışma azalıyor.
+
+    ⚠️ TAM perspektif (4 köşe + warpPerspective) denendi ve ÇOK DAHA KÖTÜ
+    çıktı: tam plaka doğruluğu %62 -> %39. Dört köşe tespiti güvenilmez,
+    yanlış dörtgen bulunca görüntüyü tamamen bozuyor. Sadece DÖNDÜRME
+    (minAreaRect) kullanılıyor; ölçüm: %62 -> %70, orijinalle birlikte
+    denenince %72.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    h, w = crop_bgr.shape[:2]
+    if h < 20 or w < 40:
+        return None
     try:
-        basarili, buffer = cv2.imencode(".jpg", gorsel_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_kalite])
-        if not basarili:
+        gri = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        gri = cv2.bilateralFilter(gri, 9, 75, 75)
+        _, esik = cv2.threshold(gri, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Karakter boşluklarını kapat ki plaka tek bir blok olsun
+        cekirdek = cv2.getStructuringElement(cv2.MORPH_RECT,
+                                             (max(5, w // 12), max(3, h // 10)))
+        kapali = cv2.morphologyEx(esik, cv2.MORPH_CLOSE, cekirdek)
+        konturlar, _ = cv2.findContours(kapali, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not konturlar:
             return None
-        return base64.b64encode(buffer).decode("utf-8")
-    except Exception as e:
-        logger.warning(f"⚠️ Görsel base64'e çevrilemedi: {e}")
+        kontur = max(konturlar, key=cv2.contourArea)
+        if cv2.contourArea(kontur) < w * h * 0.15:
+            return None
+
+        (cx, cy), (rw, rh), aci = cv2.minAreaRect(kontur)
+        if rw < rh:
+            rw, rh = rh, rw
+            aci += 90
+        # Plaka gibi durmuyorsa ya da açı saçmaysa dokunma
+        if rh < 10 or not (1.5 <= rw / rh <= 8) or abs(aci) > 30:
+            return None
+
+        donus = cv2.getRotationMatrix2D((cx, cy), aci, 1.0)
+        dondurulmus = cv2.warpAffine(crop_bgr, donus, (w, h),
+                                     flags=cv2.INTER_CUBIC,
+                                     borderMode=cv2.BORDER_REPLICATE)
+        x1, y1 = max(0, int(cx - rw / 2)), max(0, int(cy - rh / 2))
+        x2, y2 = min(w, int(cx + rw / 2)), min(h, int(cy + rh / 2))
+        if x2 - x1 < 40 or y2 - y1 < 12:
+            return None
+        kirpilmis = dondurulmus[y1:y2, x1:x2]
+        return kirpilmis if kirpilmis.size > 0 else None
+    except Exception:
         return None
 
 
-def gorsel_kaydet_ve_url_uret(gorsel_bgr, kamera_id, plaka, jpeg_kalite: int = 85):
+def _varyant_seti(crop_bgr, clahe) -> List:
+    """Tek bir kırpma için gri / CLAHE / keskin varyantlarını üretir."""
+    gri = _hedef_boyuta_olcekle(crop_bgr)
+    clahe_gri = clahe.apply(gri)
+    bulanik = cv2.GaussianBlur(clahe_gri, (0, 0), sigmaX=2.0)
+    keskin = cv2.addWeighted(clahe_gri, 1.6, bulanik, -0.6, 0)
+    return [gri, clahe_gri, keskin]
+
+
+def ocr_varyantlari(crop_bgr) -> List:
     """
-    Yakalanan aracın görselini CAPTURES_DIR'e JPEG olarak yazar ve backend'e
-    gönderilecek erişilebilir bir image_url üretir. Başarısızsa (None, None).
+    OCR'a denenecek ön-işleme varyantlarını üretir.
+
+    Eski sürüm zincirleme agresif işlem yapıyordu: CLAHE -> 400px resize ->
+    bilateral -> kontur kırpma -> 3x resize -> 4 ayrı binarizasyon. Sert
+    eşiklemeler NET bir '34 CLY 063' görüntüsünü bile bozuyordu.
+
+    Varyant seti ölçümle seçildi — hepsi aynı hatayı yapmasın diye birbirini
+    tamamlayan dönüşümler: ham gri (görüntü iyiyse en sadık), CLAHE (gölge),
+    keskinleştirme (büyütme bulanıklığı), daraltılmış bant (fazla tampon
+    alanı OCR'ı yanıltıyorsa) ve eğimi düzeltilmiş hâl (perspektif il kodunu
+    sıkıştırıyorsa).
+
+    ⚠️ SIRALAMA ÖNEMLİ: eğim düzeltilmiş varyantlar EN SONA konuyor. Orijinal
+    zaten temiz okunduysa varyant erken çıkışı devreye girip fazladan iş
+    yapılmıyor; ek maliyet yalnızca ZOR karelerde ödeniyor.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return []
+    h, w = crop_bgr.shape[:2]
+    if h < 8 or w < 20:
+        return []
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    varyantlar = _varyant_seti(crop_bgr, clahe)
+
+    # Bant daraltma gerçekten bir şey değiştirdiyse, onun ölçeklenmiş
+    # hâlini de ayrı bir varyant olarak dene.
+    dar = plaka_bandini_daralt(crop_bgr)
+    if dar is not crop_bgr and dar.shape[:2] != crop_bgr.shape[:2]:
+        varyantlar.append(_hedef_boyuta_olcekle(dar))
+
+    # 📐 Eğimi düzeltilmiş hâl — perspektifin sıkıştırdığı il kodu için.
+    # En sonda: orijinal temiz okunduysa erken çıkış bunu hiç çalıştırmaz.
+    egimsiz = plaka_egimini_duzelt(crop_bgr)
+    if egimsiz is not None:
+        varyantlar.extend(_varyant_seti(egimsiz, clahe))
+
+    return varyantlar
+
+
+EASYOCR_ALLOWLIST = "ABCDEFGHIJKLMNOPRSTUVYZ0123456789"
+
+
+def parcalari_birlestir(ocr_sonuclari) -> List[Tuple[str, float]]:
+    """
+    EasyOCR parçalarını (bbox, text, prob) aynı metin satırına göre gruplar,
+    soldan sağa birleştirir ve (birlesik_metin, ortalama_guven) adayları döner.
+
+    Plaka tek satırdır; farklı yükseklikteki parçalar (firma yazısı, ikinci
+    satır) ayrı gruplara düşer ve birbirine yapışmaz.
+    """
+    parcalar = []
+    for bbox, text, prob in ocr_sonuclari:
+        if prob < 0.10:
+            continue
+        temiz = plaka_temizle(text)
+        if not temiz:
+            continue
+        ys = [n[1] for n in bbox]
+        xs = [n[0] for n in bbox]
+        y_merkez = (min(ys) + max(ys)) / 2.0
+        yukseklik = max(max(ys) - min(ys), 1.0)
+        parcalar.append({
+            "text": temiz, "prob": float(prob),
+            "x": min(xs), "y": y_merkez, "h": yukseklik,
+        })
+
+    if not parcalar:
+        return []
+
+    parcalar.sort(key=lambda p: p["x"])
+
+    # Aynı satır grupları: dikey merkez farkı, ortalama yüksekliğin %60'ını aşmasın
+    gruplar: List[List[dict]] = []
+    for p in parcalar:
+        yerlesti = False
+        for g in gruplar:
+            ort_y = sum(q["y"] for q in g) / len(g)
+            ort_h = sum(q["h"] for q in g) / len(g)
+            if abs(p["y"] - ort_y) <= ort_h * 0.60:
+                g.append(p)
+                yerlesti = True
+                break
+        if not yerlesti:
+            gruplar.append([p])
+
+    adaylar = []
+    for g in gruplar:
+        g.sort(key=lambda p: p["x"])
+
+        # 🇹🇷 Soldaki mavi TR bandı ayrı bir parça olarak okunuyor — at.
+        while g and g[0]["text"] in TR_BANDI_DESENLERI:
+            g.pop(0)
+        if not g:
+            continue
+
+        birlesik = "".join(p["text"] for p in g)
+        ortalama = sum(p["prob"] for p in g) / len(g)
+        adaylar.append((birlesik, ortalama))
+
+        # 🇹🇷 TR bandı her zaman ayrı bir parça olarak okunmaz; bazen komşu
+        # parçaya yapışır ('TR34'). Ön eki atılmış hâlini de aday yapıyoruz ki
+        # çözümleyicide gereksiz kapsama cezası yemesin.
+        for on_ek in ("TR", "7R", "IR", "T"):
+            if birlesik.startswith(on_ek) and len(birlesik) - len(on_ek) >= 7:
+                adaylar.append((birlesik[len(on_ek):], ortalama))
+                break
+
+        # Parçalardan biri gürültüyse, ardışık alt-dizileri de aday yap
+        if len(g) > 1:
+            for i in range(len(g)):
+                for j in range(i + 1, len(g) + 1):
+                    if j - i == len(g):
+                        continue
+                    alt = g[i:j]
+                    metin = "".join(p["text"] for p in alt)
+                    if len(metin) >= 7:
+                        adaylar.append((metin, sum(p["prob"] for p in alt) / len(alt)))
+
+    return adaylar
+
+
+def kareyi_oku(crop_bgr) -> Tuple[Optional[str], float, List]:
+    """
+    Tek bir plaka karesini okur.
+    (plaka, skor, ham_parcalar) döner. Geçerli sonuç yoksa (None, 0.0, [...]).
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None, 0.0, []
+
+    # Not: bant daraltma ocr_varyantlari() içinde ayrı bir varyant olarak
+    # uygulanıyor — burada tekrar uygulanmamalı.
+    varyantlar = ocr_varyantlari(crop_bgr)
+    if not varyantlar:
+        return None, 0.0, []
+
+    en_iyi_plaka, en_iyi_skor = None, 0.0
+    ham_parcalar = []
+
+    for v_idx, varyant in enumerate(varyantlar):
+        try:
+            with INFERENCE_LOCK:
+                sonuclar = reader.readtext(varyant, allowlist=EASYOCR_ALLOWLIST,
+                                           detail=1, paragraph=False)
+        except Exception as e:
+            log(f"⚠️ OCR hatası (varyant {v_idx + 1}): {e}", "uyari")
+            continue
+        if not sonuclar:
+            continue
+
+        for (_bbox, text, prob) in sonuclar:
+            ham_parcalar.append((v_idx, text, float(prob)))
+
+        for birlesik, guven in parcalari_birlestir(sonuclar):
+            if birlesik in KARA_LISTE:          # tam eşleşme — substring DEĞİL
+                continue
+            plaka, skor = plaka_cozumle(birlesik, guven)
+            if plaka and skor > en_iyi_skor:
+                en_iyi_plaka, en_iyi_skor = plaka, skor
+
+        # ⏩ Bu varyant zaten neredeyse kusursuz okuduysa (hiç karakter
+        # düzeltmesi gerekmemiş, OCR de emin) kalan varyantları denemeye
+        # gerek yok. Kolay kareler ~4 kat hızlanıyor; kazanılan süre zor
+        # vakalarda daha çok KARE okumaya harcanıyor.
+        if en_iyi_skor >= VARYANT_ERKEN_CIKIS:
+            break
+
+    return en_iyi_plaka, en_iyi_skor, ham_parcalar
+
+
+def zamansal_mutabakat(adaylar: List[Tuple[str, float]]
+                       ) -> Tuple[Optional[str], float, int, float]:
+    """
+    Episode boyunca farklı karelerden toplanan adayları birleştirir.
+    (plaka, guven, destekleyen_kare_sayisi, kanit_payi) döner.
+
+    ⚠️ ÖNEMLİ DÜZELTME — sahada yanlış plaka gönderilmesine yol açan kusur:
+    Önceki sürüm adayları önce KARE SAYISINA göre sıralıyordu. 2026-07-23
+    loglarında bu, şu sonucu doğurdu:
+        34MAA484 (DOĞRU)  -> 1 kare, skor 0.92
+        34HAA484 (yanlış) -> 2 kare, skor 0.61 ve 0.55
+    Sayı mutlak öncelikli olduğu için YANLIŞ olan kazandı ve backend'e gitti.
+    Oysa tek bir çok net okuma, iki bulanık okumadan daha güvenilirdir.
+
+    Artık adaylar KANIT AĞIRLIĞINA göre sıralanıyor: her okumanın skorunun
+    KARESİ toplanır. Kare almak, yüksek güvenli okumaları öne çıkarır ve
+    kararsız/düşük skorlu tekrarların birikip kazanmasını engeller:
+        34MAA484 -> 0.92²             = 0.85
+        34HAA484 -> 0.61² + 0.55²     = 0.68   -> doğru olan kazanır ✅
+
+    `kanit_payi` = kazananın ağırlığı / tüm adayların toplam ağırlığı.
+    Kazananın kanıta ne kadar hâkim olduğunu ölçer; tek karelik sonuçların
+    kabulünde "ortalık karışık mı?" sorusunun cevabı olarak kullanılır.
+    """
+    if not adaylar:
+        return None, 0.0, 0, 0.0
+
+    havuz = {}
+    for plaka, skor in adaylar:
+        kayit = havuz.setdefault(plaka, {"sayi": 0, "toplam": 0.0,
+                                         "agirlik": 0.0, "en_iyi": 0.0})
+        kayit["sayi"] += 1
+        kayit["toplam"] += skor
+        kayit["agirlik"] += skor * skor
+        kayit["en_iyi"] = max(kayit["en_iyi"], skor)
+
+    en_iyi_plaka, kayit = max(havuz.items(), key=lambda o: o[1]["agirlik"])
+
+    toplam_agirlik = sum(k["agirlik"] for k in havuz.values()) or 1.0
+    kanit_payi = kayit["agirlik"] / toplam_agirlik
+
+    ortalama = kayit["toplam"] / kayit["sayi"]
+    # Tekrar eden okumaya küçük bir güven primi (en fazla +%12)
+    prim = min(0.12, 0.04 * (kayit["sayi"] - 1))
+    guven = min(1.0, max(ortalama, kayit["en_iyi"] * 0.9) + prim)
+    return en_iyi_plaka, guven, kayit["sayi"], kanit_payi
+
+
+def ayni_arac_mi(plaka: str, gonderilenler: dict, simdi: float) -> Optional[str]:
+    """
+    Bu okuma, yakın zamanda gönderilmiş bir plakayla AYNI ARACA mı ait?
+    Eşleşen önceki plakayı döner, yoksa None.
+
+    İki durumu yakalar:
+      1) Birebir aynı plaka (klasik tekrar).
+      2) SADECE İL KODU farklı, gövdesi birebir aynı olan okuma.
+         Sahada en sık görülen hata tam olarak bu: aynı kamyon ardışık
+         episode'larda '34HRR696' ve '14HRR696' olarak okundu ve backend'e
+         iki çelişkili kayıt gitti.
+
+    ⚠️ Gövde farkı BİLEREK eşleşme sayılmaz. Lojistik filolarında ardışık
+    plakalar yaygın ('34POS625' ve '34POS628' sahada gerçekten iki AYRI
+    kamyondu); gövdeye toleranslı bir birleştirme farklı araçları tek
+    kayda indirip veri kaybettirirdi.
+    """
+    for onceki, zaman in gonderilenler.items():
+        if (simdi - zaman) >= AYNI_PLAKA_BEKLEME:
+            continue
+        if onceki == plaka:
+            return onceki
+        if len(onceki) == len(plaka) and onceki[2:] == plaka[2:] and onceki[:2] != plaka[:2]:
+            return onceki
+    return None
+
+
+def kutu_ortusme_orani(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    kx1, ky1 = max(ax1, bx1), max(ay1, by1)
+    kx2, ky2 = min(ax2, bx2), min(ay2, by2)
+    kesisim = max(0, kx2 - kx1) * max(0, ky2 - ky1)
+    a_alan = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    b_alan = max(0, bx2 - bx1) * max(0, by2 - by1)
+    birlesim = a_alan + b_alan - kesisim
+    return kesisim / birlesim if birlesim > 0 else 0.0
+
+
+def gorseli_base64_kodla(gorsel_bgr, jpeg_kalite: int = 88) -> Optional[str]:
+    try:
+        ok, buffer = cv2.imencode(".jpg", gorsel_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_kalite])
+        return base64.b64encode(buffer).decode("utf-8") if ok else None
+    except Exception as e:
+        log(f"⚠️ Görsel base64'e çevrilemedi: {e}", "uyari")
+        return None
+
+
+# ==========================================================================
+# 📋 VERİ YAPILARI
+# ==========================================================================
+class KameraIstek(BaseModel):
+    kamera_id: int
+    depo_id: int
+    rtsp_url: str
+    yon: Optional[str] = "bilinmiyor"
+    aktif_mi: Optional[bool] = True
+
+
+class PlakaVeriPaketi(BaseModel):
+    kamera_id: int
+    depo_id: int
+    yon: str
+    plaka_metni: str
+    arac_tipi: str
+    guven_skoru: float
+    tarih_saat: str
+    # 🖼️ Backend base64 değil erişilebilir bir URL bekliyor (bkz. /captures).
+    image_url: Optional[str] = None
+    # Geriye dönük uyumluluk — yalnızca GORSEL_BASE64_GONDER=true iken dolar.
+    plaka_gorseli_base64: Optional[str] = None
+    tam_kare_gorseli_base64: Optional[str] = None
+
+
+class PlakaDuzeltmeIstek(BaseModel):
+    kamera_id: int
+    yanlis_plaka: str
+    dogru_plaka: str
+
+
+# ==========================================================================
+# 🎥 KAMERA TANIMLARI
+# ==========================================================================
+# 🔐 Kamera kimlik bilgileri ve adresleri env'den okunur — kaynak kodda düz
+# metin şifre bırakmıyoruz. Env verilmezse eski davranışa düşen varsayılanlar
+# kullanılır, böylece servis her koşulda ayağa kalkar.
+_GEBZE_KULLANICI = os.getenv("GEBZE_KAMERA_KULLANICI", "admin")
+_GEBZE_SIFRE = os.getenv("GEBZE_KAMERA_SIFRE", "center@dhl99")
+_GEBZE_SIFRE_ENCODED = quote(_GEBZE_SIFRE, safe="")
+_GEBZE_HOST = os.getenv("GEBZE_KAMERA_HOST", "2.200.168.165")
+_GEBZE_GIRIS_PORT = os.getenv("GEBZE_GIRIS_PORT", "8001")
+_GEBZE_CIKIS_PORT = os.getenv("GEBZE_CIKIS_PORT", "8003")
+
+# 📡 RTSP profili. profile1 = ana akış, profile2 = alt akış.
+# Sahada profile2 de 2560x1440 veriyor ve doğrulanmış okumaların tamamı bu
+# akıştan alındı — bant genişliği açısından varsayılan olarak bunu tutuyoruz.
+RTSP_PROFIL = os.getenv("RTSP_PROFIL", "profile2")
+
+GEBZE_KAMERALARI = [
+    {
+        "kamera_id": 1, "depo_id": 1, "yon": "giris", "isim": "Gebze Giriş Kamerası",
+        "rtsp_url": (f"rtsp://{_GEBZE_KULLANICI}:{_GEBZE_SIFRE_ENCODED}@{_GEBZE_HOST}:"
+                     f"{_GEBZE_GIRIS_PORT}/{RTSP_PROFIL}/media.smp"),
+    },
+    {
+        "kamera_id": 2, "depo_id": 1, "yon": "cikis", "isim": "Gebze Çıkış Kamerası",
+        "rtsp_url": (f"rtsp://{_GEBZE_KULLANICI}:{_GEBZE_SIFRE_ENCODED}@{_GEBZE_HOST}:"
+                     f"{_GEBZE_CIKIS_PORT}/{RTSP_PROFIL}/media.smp"),
+    },
+]
+
+son_yakalanan_goruntuler = {}
+KAMERA_DURUMLARI = {}   # kamera_id -> canlı istatistik (durum uçları için)
+_durum_kilit = threading.Lock()
+
+
+def durum_guncelle(kamera_id: int, **alanlar):
+    with _durum_kilit:
+        KAMERA_DURUMLARI.setdefault(kamera_id, {}).update(alanlar)
+
+
+# ==========================================================================
+# 📡 RTSP OKUYUCU — ayrı thread, daima en güncel kare
+# ==========================================================================
+class KameraOkuyucu:
+    """
+    RTSP akışını kendi thread'inde sürekli okur ve sadece EN SON kareyi tutar.
+
+    Neden gerekli: YOLO+OCR bir kareyi işlerken kamera yeni kareler üretmeye
+    devam eder ve bunlar FFMPEG tamponunda birikir. Ana döngü cap.read()
+    çağırdığında saniyeler ÖNCESİNE ait bayat bir kare alır; araç çoktan
+    geçmiş olur. CAP_PROP_BUFFERSIZE=1 FFMPEG backend'inde çoğu zaman
+    yok sayılır. Okumayı ayırmak bu gecikmeyi tamamen ortadan kaldırır.
+    """
+
+    def __init__(self, rtsp_url: str, etiket: str):
+        self.rtsp_url = rtsp_url
+        self.etiket = etiket
+        self._kare = None
+        self._sayac = 0
+        self._kilit = threading.Lock()
+        self._dur = False
+        self._thread = None
+        self.baglanti_tamam = False
+
+    def basla(self):
+        self._thread = threading.Thread(target=self._dongu, daemon=True,
+                                        name=f"rtsp-{self.etiket}")
+        self._thread.start()
+
+    def _dongu(self):
+        cap = None
+        while not self._dur:
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    self.baglanti_tamam = False
+                    log(f"❌ {self.etiket} RTSP akışı açılamadı, 5 sn sonra tekrar denenecek.", "hata")
+                    time.sleep(5)
+                    continue
+                self.baglanti_tamam = True
+                log(f"🎥 {self.etiket} RTSP akışı açıldı.")
+
+            ret, kare = cap.read()
+            if not ret or kare is None:
+                self.baglanti_tamam = False
+                log(f"⚠️ {self.etiket} kare alınamadı, akış yeniden kurulacak.", "uyari")
+                cap.release()
+                cap = None
+                time.sleep(2)
+                continue
+
+            with self._kilit:
+                self._kare = kare
+                self._sayac += 1
+
+        if cap is not None:
+            cap.release()
+
+    def son_kare(self):
+        """(kare_kopyasi, sayac) döner; henüz kare yoksa (None, 0)."""
+        with self._kilit:
+            if self._kare is None:
+                return None, 0
+            return self._kare.copy(), self._sayac
+
+    def durdur(self):
+        self._dur = True
+
+
+# ==========================================================================
+# 🧠 ANA PIPELINE
+# ==========================================================================
+def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: str = "bilinmiyor"):
+    etiket = f"[{yon.upper()} K{kamera_id}]"
+    log(f"🔌 {etiket} pipeline başlatılıyor...")
+
+    okuyucu = KameraOkuyucu(rtsp_url, etiket)
+    okuyucu.basla()
+
+    durum_guncelle(kamera_id, yon=yon, depo_id=depo_id, baslangic=datetime.now().isoformat(),
+                   toplam_episode=0, toplam_okuma=0, son_plaka=None, son_okuma_zamani=None)
+
+    son_islenen_sayac = -1
+    son_heartbeat = time.time()
+
+    # Episode durumu
+    arac_aktif = False
+    arac_baslangic = 0.0
+    son_tespit = 0.0
+    episode_arac_tipi = "bilinmiyor"
+    kare_havuzu: List[dict] = []
+    episod_kutu = None
+    # 🖼️ Episode'un en iyi TAM karesi (image_url ve debug kaydı için)
+    en_iyi_tam_kare = None
+    en_iyi_tam_kare_kutu = None
+    en_iyi_tam_kare_skoru = 0.0
+
+    son_islenen_kutu = None
+    son_islenen_zaman = 0.0
+    gonderilen_plakalar = {}   # plaka -> son gönderim zamanı
+    # 🩺 Teşhis sayaçları: elenen plaka kutularının sebepleri
+    tani_sayaclari = {}
+
+    while True:
+        # 🛡️ HATA KORUMASI: tek bir bozuk karede fırlayan exception, bu
+        # kameranın thread'ini KALICI olarak öldürürdü — servis ayakta
+        # görünmeye devam eder ama o kamera sessizce ölür. Döngü gövdesini
+        # koruyoruz: hatayı logla, sonraki kareye geç.
+        try:
+            kare, sayac = okuyucu.son_kare()
+
+            # ⚠️ Aynı kareyi İKİ KEZ işlememek kritik: aksi halde tek bir okuma
+            # havuza defalarca girip SAHTE MUTABAKAT üretir (zamansal_mutabakat
+            # "5 farklı karede aynı sonuç" sanar) ve GPU boşa yanar. Yeni kare
+            # yoksa kareyi işlemeye hiç sokmuyoruz — ama episode zaman aşımı
+            # kontrolü aşağıda yine de çalışmalı, yoksa araç ayrıldığında
+            # episode hiç kapanmaz.
+            yeni_kare_var = kare is not None and sayac != son_islenen_sayac
+            if yeni_kare_var:
+                son_islenen_sayac = sayac
+            else:
+                kare = None
+                time.sleep(0.01)   # yeni kare yok — CPU'yu boşa yakma
+
+            simdi = time.time()
+
+            # 💓 Heartbeat
+            if not arac_aktif and (simdi - son_heartbeat) >= HEARTBEAT_SANIYE:
+                baglanti = "canlı" if okuyucu.baglanti_tamam else "KOPUK"
+                mesaj = f"💓 {etiket} Akış {baglanti}, son {int(HEARTBEAT_SANIYE)} sn'de araç yok."
+                # 🩺 Sürekli "çok küçük" eleniyorsa bu bir YAZILIM değil KAMERA
+                # AÇISI sorunudur — kullanıcı bunu logdan görebilmeli.
+                kucuk = tani_sayaclari.get("cok_kucuk", 0)
+                if kucuk > 0:
+                    mesaj += (f"  ⚠️ bu pencerede {kucuk} kez 'plaka çok küçük' elendi — "
+                              f"kamera açısı/zoom plakayı yeterince büyük görmüyor olabilir.")
+                log(mesaj)
+                son_heartbeat = simdi
+                # Sayaçlar PENCERE bazlı olmalı: kümülatif toplam sürekli büyüyüp
+                # ("1112 kez") sorunun hâlâ sürüp sürmediğini gizliyordu.
+                tani_sayaclari.clear()
+
+            if kare is not None:
+                # 🚫 Üstteki tarih/saat filigranı ve sabit yazı bandını karart
+                if UST_MASKE_ORANI > 0:
+                    h_f, w_f = kare.shape[:2]
+                    kare[0:int(h_f * UST_MASKE_ORANI), 0:w_f] = (0, 0, 0)
+
+                # ---------- ADIM 1: Araç tespiti ----------
+                arac_kutusu, arac_tipi, insan_kutulari = arac_tespit_et(kare)
+
+                # ---------- ADIM 2: Plaka tespiti (araç kutusu içinde) ----------
+                en_iyi_kutu, en_iyi_conf = None, 0.0
+                if arac_kutusu is not None or not PLAKA_ARAC_ZORUNLU:
+                    en_iyi_kutu, en_iyi_conf = plaka_tespit_et(
+                        kare, arac_kutusu, insan_kutulari, etiket, tani_sayaclari)
+                    durum_guncelle(kamera_id, elenen_kutular=dict(tani_sayaclari))
+
+                # ---------- ADIM 3: Episode yönetimi ----------
+                if en_iyi_kutu is not None:
+                    x1, y1, x2, y2 = en_iyi_kutu
+                    crop = kare[y1:y2, x1:x2]
+
+                    if crop.size > 0:
+                        if not arac_aktif:
+                            # 🧊 Cooldown: az önce işlediğimiz aynı konumdaki nesne mi?
+                            #
+                            # ⚠️ Bu kontrol KONUMSAL olmalı, sadece zamana bağlı
+                            # DEĞİL. Sahada (2026-07-23) bir kamyon çıkış kapısında
+                            # durdu; sabit süreli cooldown dolunca sistem sürekli
+                            # yeni episode açtı ve aynı plakayı 83 saniye arayla
+                            # İKİ KEZ backend'e gönderdi — tek araç için iki kayıt.
+                            # Araç kutusu hâlâ aynı yerdeyse zamanlayıcıyı
+                            # TAZELİYORUZ: duran araç asla yeniden tetiklemez, ama
+                            # gerçekten ayrılıp yerine yenisi geldiğinde (kutu
+                            # kayar, IoU düşer) episode anında açılır.
+                            if (son_islenen_kutu is not None
+                                    and (simdi - son_islenen_zaman) < COOLDOWN_SANIYE
+                                    and kutu_ortusme_orani(en_iyi_kutu, son_islenen_kutu) > COOLDOWN_IOU_ESIGI):
+                                son_islenen_zaman = simdi   # araç hâlâ orada — süreyi uzat
+                            else:
+                                arac_aktif = True
+                                arac_baslangic = simdi
+                                kare_havuzu = []
+                                episode_arac_tipi = arac_tipi
+                                log(f"🚗 {etiket} Araç algılandı ({arac_tipi}) — kare toplanıyor...")
+
+                        if arac_aktif:
+                            son_tespit = simdi
+                            episod_kutu = en_iyi_kutu
+
+                            keskinlik = keskinlik_skoru(crop)
+                            if keskinlik < MIN_KESKINLIK:
+                                log_ayrinti(f"   🏃 {etiket} Bulanık kare atlandı (keskinlik={keskinlik:.0f}).")
+                            else:
+                                kare_havuzu.append({
+                                    "gorsel": crop,
+                                    "alan": (x2 - x1) * (y2 - y1),
+                                    "keskinlik": keskinlik,
+                                    "conf": en_iyi_conf,
+                                    "kutu": en_iyi_kutu,
+                                })
+
+                                # 🖼️ Episode'un EN İYİ tam karesini tek bir değişkende
+                                # tutuyoruz.
+                                # ⚠️ Bellek: eskiden her havuz kaydına kare.copy()
+                                # konuyordu. 2560x1440 bir kare ~11 MB; sahada 179
+                                # karelik episode'lar görüldü -> ~2 GB. Tek bir "en
+                                # iyi" kare tutmak bunu sabit maliyete indiriyor.
+                                tam_kare_skoru = keskinlik * (x2 - x1)
+                                if tam_kare_skoru > en_iyi_tam_kare_skoru:
+                                    en_iyi_tam_kare_skoru = tam_kare_skoru
+                                    en_iyi_tam_kare = kare.copy()
+                                    en_iyi_tam_kare_kutu = en_iyi_kutu
+
+                            if DEBUG_KARE_KAYDET:
+                                ad = f"kam{kamera_id}_{int(simdi * 1000)}.jpg"
+                                cv2.imwrite(os.path.join(DEBUG_KARE_DIR, ad), crop)
+
+            # ---------- ADIM 4: Episode sonlandırma ----------
+            if arac_aktif:
+                ayrildi = (simdi - son_tespit) >= ARAC_AYRILMA_BOSLUGU
+                zaman_asimi = (simdi - arac_baslangic) >= MAKS_TOPLAMA_SANIYESI
+
+                if ayrildi or zaman_asimi:
+                    sebep = "araç ayrıldı" if ayrildi else "azami süre doldu"
+                    log(f"⏱️ {etiket} Toplama bitti ({sebep}) — {len(kare_havuzu)} kare toplandı.")
+
+                    episode_isle(kamera_id, depo_id, yon, etiket, kare_havuzu,
+                                 episode_arac_tipi, gonderilen_plakalar,
+                                 en_iyi_tam_kare, en_iyi_tam_kare_kutu)
+
+                    if episod_kutu is not None:
+                        son_islenen_kutu = episod_kutu
+                        son_islenen_zaman = time.time()
+
+                    en_iyi_tam_kare = None
+                    en_iyi_tam_kare_kutu = None
+                    en_iyi_tam_kare_skoru = 0.0
+                    arac_aktif = False
+                    kare_havuzu = []
+                    episod_kutu = None
+                    son_heartbeat = time.time()
+        except Exception as e:
+            log(f"❌ {etiket} Kare işlenirken beklenmeyen hata: {e}", "hata")
+            logger.exception("kare işleme hatası")
+            time.sleep(0.5)
+            continue
+
+
+def arac_tespit_et(kare):
+    """
+    COCO ile araç ve insan kutularını bulur.
+    (arac_kutusu | None, arac_tipi, insan_kutulari) döner.
+
+    ⚠️ Eski sürümde karede herhangi bir insan görülürse TÜM kare atlanıyordu
+    (`continue`). Şoför kabinde neredeyse her zaman göründüğü için bu, araç
+    geçişlerinin büyük kısmının hiç işlenmemesine yol açıyordu. Artık insan
+    kutuları sadece plaka adaylarını elemek için kullanılıyor.
+    """
+    with INFERENCE_LOCK:
+        sonuclar = detection_model(kare, device=AI_DEVICE, verbose=False, conf=ARAC_TESPIT_CONF)
+
+    insan_kutulari = []
+    en_buyuk_arac, en_buyuk_alan, arac_tipi = None, 0, "bilinmiyor"
+
+    for sonuc in sonuclar:
+        for kutu in sonuc.boxes:
+            sinif = int(kutu.cls[0])
+            xyxy = tuple(map(int, kutu.xyxy[0].cpu().numpy()))
+
+            if sinif == 0:
+                insan_kutulari.append(xyxy)
+                continue
+
+            if sinif in COCO_ARAC_SINIFLARI:
+                alan = (xyxy[2] - xyxy[0]) * (xyxy[3] - xyxy[1])
+                if alan > en_buyuk_alan:
+                    en_buyuk_alan = alan
+                    en_buyuk_arac = xyxy
+                    arac_tipi = COCO_CLASSES.get(sinif, "bilinmiyor")
+
+    return en_buyuk_arac, arac_tipi, insan_kutulari
+
+
+def plaka_tespit_et(kare, arac_kutusu, insan_kutulari, etiket, sayaclar=None):
+    """
+    Plaka kutusunu bulur. Arama, varsa araç kutusuyla sınırlanır.
+    (en_iyi_kutu | None, conf) döner.
+
+    `sayaclar` verilirse elenen kutuların sebepleri sayılır — bir kamera
+    sürekli "çok küçük" eliyorsa bu bir YAZILIM değil KAMERA AÇISI sorunudur
+    ve /api/v1/kamera/durum üzerinden görülebilir olmalı.
+
+    ⚠️ Eski sürümde adaylar arasından ALANI EN BÜYÜK olan seçiliyordu. Kamyon
+    üstündeki uyarı çıkartması gerçek plakadan büyük göründüğünde, o karede
+    gerçek plaka havuza hiç girmiyor, etiket OCR'a gidiyordu. Artık dedektörün
+    en GÜVENDİĞİ kutu seçiliyor.
+    """
+    arama_karesi = kare
+    ofset_x, ofset_y = 0, 0
+
+    if arac_kutusu is not None:
+        ax1, ay1, ax2, ay2 = arac_kutusu
+        pay = int((ay2 - ay1) * 0.10)
+        ax1, ay1 = max(0, ax1 - pay), max(0, ay1 - pay)
+        ax2 = min(kare.shape[1], ax2 + pay)
+        ay2 = min(kare.shape[0], ay2 + pay)
+        if ax2 > ax1 and ay2 > ay1:
+            arama_karesi = kare[ay1:ay2, ax1:ax2]
+            ofset_x, ofset_y = ax1, ay1
+
+    if arama_karesi.size == 0:
+        return None, 0.0
+
+    with INFERENCE_LOCK:
+        sonuclar = model(arama_karesi, device=AI_DEVICE, verbose=False,
+                         conf=PLAKA_CONF_ESIGI, imgsz=PLAKA_IMGSZ)
+
+    en_iyi_kutu, en_iyi_conf = None, 0.0
+
+    for sonuc in sonuclar:
+        for kutu in sonuc.boxes:
+            x1, y1, x2, y2 = map(int, kutu.xyxy[0].cpu().numpy())
+            x1, y1 = x1 + ofset_x, y1 + ofset_y
+            x2, y2 = x2 + ofset_x, y2 + ofset_y
+            conf = float(kutu.conf[0]) if kutu.conf is not None else 0.0
+
+            genislik, yukseklik = x2 - x1, y2 - y1
+            if genislik < PLAKA_MIN_GENISLIK or yukseklik < 16:
+                if sayaclar is not None:
+                    sayaclar["cok_kucuk"] = sayaclar.get("cok_kucuk", 0) + 1
+                log_ayrinti(f"   🚫 {etiket} Kutu çok küçük ({genislik}x{yukseklik}px) — okunamaz.")
+                continue
+
+            oran = genislik / float(yukseklik)
+            if not (PLAKA_EN_BOY_MIN <= oran <= PLAKA_EN_BOY_MAX):
+                if sayaclar is not None:
+                    sayaclar["oran_uymadi"] = sayaclar.get("oran_uymadi", 0) + 1
+                log_ayrinti(f"   🚫 {etiket} Kutu elendi (oran={oran:.2f}, güven={conf:.2f}).")
+                continue
+
+            # 🚚 Araca göre çok büyük bir kutu plaka değildir — kapı/kaporta
+            # üzerindeki firma yazısıdır (bkz. PLAKA_MAKS_ARAC_ORANI).
+            if arac_kutusu is not None:
+                arac_alan = max(1, (arac_kutusu[2] - arac_kutusu[0]) * (arac_kutusu[3] - arac_kutusu[1]))
+                alan_orani = (genislik * yukseklik) / float(arac_alan)
+                if alan_orani > PLAKA_MAKS_ARAC_ORANI:
+                    if sayaclar is not None:
+                        sayaclar["araca_gore_buyuk"] = sayaclar.get("araca_gore_buyuk", 0) + 1
+                    log_ayrinti(f"   🚫 {etiket} Kutu araca göre çok büyük "
+                                f"(%{alan_orani*100:.1f} > %{PLAKA_MAKS_ARAC_ORANI*100:.0f}) — "
+                                f"muhtemelen kaporta/kapı yazısı.")
+                    continue
+
+            # Bir insanın üzerindeki yazı/kart plaka sanılmasın
+            if any(kutu_ortusme_orani((x1, y1, x2, y2), ik) > 0.35 for ik in insan_kutulari):
+                if sayaclar is not None:
+                    sayaclar["insan_cakismasi"] = sayaclar.get("insan_cakismasi", 0) + 1
+                log_ayrinti(f"   🚫 {etiket} Kutu insanla çakışıyor, elendi.")
+                continue
+
+            if conf > en_iyi_conf:
+                en_iyi_conf = conf
+                # Yatayda hafif pay: karakterlerin kenarı kesilmesin.
+                # Dikeyde pay YOK — YOLO kutusu zaten plakadan yüksek geliyor.
+                pay_x = int(yukseklik * 0.08)
+                en_iyi_kutu = (
+                    max(0, x1 - pay_x), max(0, y1),
+                    min(kare.shape[1], x2 + pay_x), min(kare.shape[0], y2),
+                )
+
+    return en_iyi_kutu, en_iyi_conf
+
+
+def episode_isle(kamera_id, depo_id, yon, etiket, kare_havuzu, arac_tipi,
+                 gonderilen_plakalar, en_iyi_tam_kare=None, en_iyi_tam_kare_kutu=None):
+    """Bir araç geçişinde toplanan kareleri OCR'a sokar, mutabakat alır, gönderir."""
+    if len(kare_havuzu) < MIN_ISLEME_KARE_SAYISI:
+        log(f"⚠️ {etiket} Sadece {len(kare_havuzu)} kare — anlık yanlış algılama, OCR yapılmıyor.")
+        return
+
+    with _durum_kilit:
+        KAMERA_DURUMLARI.setdefault(kamera_id, {})
+        KAMERA_DURUMLARI[kamera_id]["toplam_episode"] = \
+            KAMERA_DURUMLARI[kamera_id].get("toplam_episode", 0) + 1
+
+    # En iyi kareler: netlik + boyut + dedektör güveni
+    max_alan = max(k["alan"] for k in kare_havuzu) or 1
+    max_keskinlik = max(k["keskinlik"] for k in kare_havuzu) or 1
+    for k in kare_havuzu:
+        k["skor"] = (0.35 * (k["alan"] / max_alan)
+                     + 0.45 * (k["keskinlik"] / max_keskinlik)
+                     + 0.20 * k["conf"])
+    kare_havuzu.sort(key=lambda k: k["skor"], reverse=True)
+    secilen = kare_havuzu[:OCR_KARE_SAYISI]
+
+    # 🖼️ Episode'un en iyi tam karesi — YOLO kutusu çizili hâli hem debug
+    # kaydı hem de backend'e gidecek image_url için kullanılır.
+    kutulu_tam_kare = None
+    if en_iyi_tam_kare is not None and en_iyi_tam_kare_kutu is not None:
+        kutulu_tam_kare = en_iyi_tam_kare.copy()
+        bx1, by1, bx2, by2 = en_iyi_tam_kare_kutu
+        cv2.rectangle(kutulu_tam_kare, (bx1, by1), (bx2, by2), (0, 255, 0), 3)
+        if DEBUG_ORIJINAL_KARE_KAYDET:
+            ad = f"kam{kamera_id}_{yon}_{int(time.time() * 1000)}.jpg"
+            cv2.imwrite(os.path.join(DEBUG_ORIJINAL_KARE_DIR, ad), kutulu_tam_kare)
+
+    adaylar = []
+    okunan_kare = 0
+    for idx, k in enumerate(secilen):
+        son_yakalanan_goruntuler[kamera_id] = k["gorsel"].copy()
+        plaka, skor, ham = kareyi_oku(k["gorsel"])
+        okunan_kare += 1
+
+        if _AYRINTILI:
+            for (v_idx, text, prob) in ham:
+                log_ayrinti(f"   🔍 [Kare {idx + 1}/V{v_idx + 1}] '{text}' ({prob:.2f})")
+
+        if plaka:
+            log(f"   → {etiket} [Kare {idx + 1}] Aday: {plaka} (skor {skor:.2f})")
+            adaylar.append((plaka, skor))
+        else:
+            log_ayrinti(f"   ⚠️ [Kare {idx + 1}] Geçerli plaka çözümlenemedi.")
+
+        # ⏩ ERKEN ÇIKIŞ: yeterli sayıda kare zaten aynı plakada anlaştıysa
+        # kalanları okumak sonucu değiştirmez. Kolay vakalar hızlanır,
+        # böylece zor vakalara daha fazla kare bütçesi ayırabiliyoruz.
+        if len(adaylar) >= ERKEN_CIKIS_OY:
+            _p, _g, _d, _pay = zamansal_mutabakat(adaylar)
+            if _d >= ERKEN_CIKIS_OY and _g >= ERKEN_CIKIS_GUVEN:
+                break
+
+    plaka, guven, destek, kanit_payi = zamansal_mutabakat(adaylar)
+
+    if plaka is None:
+        log(f"⚠️ {etiket} Bu araçta okunabilir plaka bulunamadı ({okunan_kare} kare denendi).")
+        return
+
+    log(f"🗳️ {etiket} Mutabakat: {plaka} — {destek}/{okunan_kare} karede, "
+        f"güven {guven:.2f}, kanıt payı {kanit_payi:.0%}")
+
+    # 🧠 Güvenlik görevlisinin geçmiş düzeltmesi
+    duzeltilmis, hafizadan = hafizadan_duzelt(plaka)
+    if hafizadan and duzeltilmis != plaka:
+        log(f"🧠 {etiket} [HAFIZA] '{plaka}' → '{duzeltilmis}'")
+        plaka, guven = duzeltilmis, max(guven, 0.90)
+
+    # ---- Kabul kriterleri ----
+    # Tek karelik bir sonuç ancak HEM çok güvenliyse HEM de kanıtın büyük
+    # kısmına hâkimse kabul edilir. Her karenin farklı bir şey okuduğu
+    # kaotik episode'larda (hızlı geçen araç) en yüksek skorlu aday bile
+    # güvenilir değildir.
+    yeterli_mutabakat = (destek >= MIN_MUTABAKAT_KARE
+                         or (guven >= TEK_KARE_KESIN_GUVEN and kanit_payi >= TEK_KARE_MIN_PAY))
+
+    if guven < MIN_PLAKA_GUVENI:
+        log(f"⛔ {etiket} '{plaka}' düşük güven ({guven:.2f} < {MIN_PLAKA_GUVENI}) — GÖNDERİLMEDİ.")
+        return
+    if kanit_payi < MIN_KANIT_PAYI:
+        log(f"⛔ {etiket} '{plaka}' kanıtın yalnızca %{kanit_payi*100:.0f}'ine sahip "
+            f"(gereken %{MIN_KANIT_PAYI*100:.0f}) — kareler birbiriyle çelişiyor, GÖNDERİLMEDİ.")
+        return
+    if not yeterli_mutabakat:
+        log(f"⛔ {etiket} '{plaka}' sadece {destek} karede göründü (min {MIN_MUTABAKAT_KARE}); "
+            f"güven {guven:.2f} / kanıt payı {kanit_payi:.0%} tek kare için yetersiz "
+            f"(gereken {TEK_KARE_KESIN_GUVEN} ve {TEK_KARE_MIN_PAY:.0%}) — GÖNDERİLMEDİ.")
+        return
+
+    simdi = time.time()
+    ayni_arac = ayni_arac_mi(plaka, gonderilen_plakalar, simdi)
+    if ayni_arac is not None:
+        gecen = int(simdi - gonderilen_plakalar[ayni_arac])
+        if ayni_arac == plaka:
+            log(f"🔁 {etiket} '{plaka}' {gecen} sn önce gönderildi — tekrar gönderilmiyor.")
+        else:
+            log(f"🔁 {etiket} '{plaka}' okundu ama {gecen} sn önce gönderilen "
+                f"'{ayni_arac}' ile aynı araç görünüyor (sadece il kodu farklı) — "
+                f"çift kayıt olmasın diye gönderilmiyor.", "uyari")
+        return
+
+    gonderilen_plakalar[plaka] = simdi
+
+    log(f"🎯 {etiket} PLAKA OKUNDU → {plaka}  (güven {guven:.2f}, {destek} kare mutabakatı)", "basari")
+
+    durum_guncelle(kamera_id, son_plaka=plaka, son_okuma_zamani=datetime.now().isoformat())
+    with _durum_kilit:
+        KAMERA_DURUMLARI[kamera_id]["toplam_okuma"] = \
+            KAMERA_DURUMLARI[kamera_id].get("toplam_okuma", 0) + 1
+
+    en_iyi_gorsel = kare_havuzu[0]["gorsel"]
+    plaka_b64 = gorseli_base64_kodla(en_iyi_gorsel) if GORSEL_BASE64_GONDER else None
+
+    tam_kare_b64 = (gorseli_base64_kodla(kutulu_tam_kare)
+                    if (GORSEL_BASE64_GONDER and kutulu_tam_kare is not None) else None)
+
+    # 🖼️ Backend base64 değil erişilebilir bir URL bekliyor. Tam kare varsa
+    # onu tercih ediyoruz (aracı da gösterir), yoksa kırpılmış plakayı.
+    image_url = gorsel_kaydet_ve_url_uret(
+        kutulu_tam_kare if kutulu_tam_kare is not None else en_iyi_gorsel,
+        kamera_id, plaka)
+
+    paket = PlakaVeriPaketi(
+        kamera_id=kamera_id, depo_id=depo_id, yon=yon,
+        plaka_metni=plaka, arac_tipi=arac_tipi,
+        guven_skoru=float(guven),
+        tarih_saat=datetime.now(timezone.utc).isoformat(),
+        image_url=image_url,
+        plaka_gorseli_base64=plaka_b64,
+        tam_kare_gorseli_base64=tam_kare_b64,
+    )
+    send_plate_to_backend_sync(paket)
+
+
+def gorsel_kaydet_ve_url_uret(gorsel_bgr, kamera_id: int, plaka: str,
+                              jpeg_kalite: int = 88) -> Optional[str]:
+    """
+    Yakalanan görseli CAPTURES_DIR'e yazar ve backend'e gönderilecek
+    erişilebilir bir URL döner. Başarısızsa None.
     """
     try:
-        guvenli_plaka = re.sub(r'[^A-Z0-9]', '', (plaka or "").upper()) or "PLAKA"
-        dosya_adi = f"kam{kamera_id}_{guvenli_plaka}_{int(time.time() * 1000)}.jpg"
+        guvenli = re.sub(r"[^A-Z0-9]", "", (plaka or "").upper()) or "PLAKA"
+        dosya_adi = f"kam{kamera_id}_{guvenli}_{int(time.time() * 1000)}.jpg"
         hedef = os.path.join(CAPTURES_DIR, dosya_adi)
-        basarili = cv2.imwrite(hedef, gorsel_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_kalite])
-        if not basarili:
-            return None, None
-        return f"{AI_SERVICE_PUBLIC_BASE_URL.rstrip('/')}/captures/{dosya_adi}", hedef
+        if not cv2.imwrite(hedef, gorsel_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_kalite]):
+            return None
+        return f"{AI_SERVICE_PUBLIC_BASE_URL.rstrip('/')}/captures/{dosya_adi}"
     except Exception as e:
-        logger.error(f"⚠️ Yakalanan görsel diske yazılamadı: {e}")
-        return None, None
+        log(f"⚠️ Yakalanan görsel diske yazılamadı: {e}", "uyari")
+        return None
 
 
 def send_plate_to_backend_sync(paket: PlakaVeriPaketi):
-    """ Arka plan thread'lerinden backend'e (Go ANPR webhook) güvenli, senkron veri yollar. """
+    """
+    Plakayı Go backend'in ANPR webhook'una gönderir.
+
+    Gövde, Go `WebhookEvent` şemasına hizalıdır. Go bilinmeyen alanları yok
+    saydığı için yon/arac_tipi gibi ekstralar zarar vermez; asıl mesele
+    beklenen alanların doğru AD ve TİPLE gitmesi.
+    """
     try:
-        # Go 'WebhookEvent' şemasına hizalı gövde. (Go bilinmeyen alanları yok sayar,
-        # bu yüzden yon/arac_tipi/base64 gibi ekstralar zarar vermez.)
         govde = {
             "depot_id": DEPOT_ID,
             "camera_id": str(paket.kamera_id),
@@ -740,7 +1745,7 @@ def send_plate_to_backend_sync(paket: PlakaVeriPaketi):
             "confidence_score": paket.guven_skoru,
             "image_url": paket.image_url or "",
             "detected_at": paket.tarih_saat,
-            # Fazladan alanlar (ileride kullanılabilir):
+            # Fazladan alanlar (Go yok sayar, ileride kullanılabilir)
             "yon": paket.yon,
             "arac_tipi": paket.arac_tipi,
         }
@@ -748,422 +1753,115 @@ def send_plate_to_backend_sync(paket: PlakaVeriPaketi):
             govde["plaka_gorseli_base64"] = paket.plaka_gorseli_base64
             govde["tam_kare_gorseli_base64"] = paket.tam_kare_gorseli_base64
 
-        logger.info(f"🔗 [Backend POST] Plaka '{paket.plaka_metni}' -> {BACKEND_EVENTS_URL}")
         response = requests.post(BACKEND_EVENTS_URL, json=govde, timeout=5.0)
         if response.status_code == 200:
-            logger.info("✅ Backend veriyi aldı: Başarılı (200)")
+            log(f"✅ Backend veriyi aldı: {paket.plaka_metni}")
         else:
-            logger.warning(f"⚠️ Backend beklenmeyen bir kod döndü: {response.status_code} — {response.text[:200]}")
+            log(f"⚠️ Backend beklenmeyen kod döndü: {response.status_code} — "
+                f"{response.text[:200]}", "uyari")
     except Exception as exc:
-        logger.error(f"❌ Backend'e ulaşılamadı (Backend kapalı olabilir): {exc}")
+        log(f"❌ Backend'e ulaşılamadı ({BACKEND_EVENTS_URL}): {exc}", "hata")
 
 
-# --- 📹 GERÇEK YAPAY ZEKA VE KAMERA AKIŞ MOTORU ---
-def gercek_yolo_ocr_pipeline(kamera_id: int, depo_id: int, rtsp_url: str, yon: str = "bilinmiyor"):
-    global son_yakalanan_goruntuler, son_okunan_plaka_global
-    logger.info(f"🔌 [{yon.upper()}] {rtsp_url} adresi için OpenCV video yakalayıcı hazırlanıyor...")
-
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not cap.isOpened():
-        logger.error(f"❌ Kamera akışı açılamadı! RTSP adresi yanlış veya ağda erişim yok: {rtsp_url}")
-        return
-
-    logger.info(f"🎥 [{yon.upper()}] Kamera {kamera_id} akışı canlı olarak işleniyor...")
-
-    son_gonderim_zamani = 0.0
-    # 🧠 Zaman pencereli tekrar-gönderim filtresi: plaka -> son gönderim zamanı.
-    # (Eskisi tek plakayı süresiz bloke ediyordu; artık pencere dolunca tekrar edilebilir.)
-    gonderilen_plakalar = {}
-
-    # ⏳ AKILLI ARAÇ/PLAKA TAMPON MEKANİZMASI DEĞİŞKENLERİ
-    arac_algilandi_mi = False
-    arac_baslangic_zamani = 0.0
-    son_tespit_zamani = 0.0   # bu episode'da aracın EN SON görüldüğü an
-    episode_arac_tipi = "bilinmiyor"  # 🚗 Bu episode'da tespit edilen araç tipi
-    kare_havuzu = []
-    episode_junk_kelimeleri = set()  # bu episode'da görülen, plaka olamayacak metin parçaları
-    # 🚗 Bu episode'da aracın EN BÜYÜK göründüğü tam kare (backend'e "araç görseli"
-    # olarak gönderilir). Belleği şişirmemek için sadece en iyi kareyi tutuyoruz.
-    episode_temsili_kare = None
-    episode_temsili_alan = 0
-
-    # 🚗 Araç kadrajda kaldığı SÜRECE kare topluyoruz; ayrıldığında veya azami
-    # süre dolduğunda işliyoruz (böylece yavaş araç tek episode'da kalır).
-    ARAC_AYRILMA_BOSLUGU = 1.2     # saniye — bu kadar tespit gelmezse araç ayrılmış sayılır
-    MAKS_TOPLAMA_SANIYESI = 6.0    # saniye — güvenlik amaçlı azami toplama süresi
-    MIN_ISLEME_KARE_SAYISI = 2     # 🎯 Hareket eden araçlar için düşük
-
-    # 🧊 COOLDOWN: arka planda duran sabit bir nesnenin tekrar tekrar okunmasını engeller
-    son_islenen_kutu = None
-    son_islenen_zaman = 0.0
-    episod_kutu = None
-    COOLDOWN_SANIYE = 8.0
-    COOLDOWN_IOU_ESIGI = 0.7
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            logger.warning(f"⚠️ Kamera {kamera_id} akışından kare alınamadı, 5 saniye sonra yeniden deniyor...")
-            time.sleep(5)
-            cap.open(rtsp_url)
-            continue
-
-        # 🛡️ Tek bir bozuk kare / çıkarım hatası thread'i ÖLDÜRMESİN diye kare işleme
-        # gövdesini komple hata-güvenli sarıyoruz: hata olursa logla ve sonraki kareye geç.
-        try:
-            # 🚫 Kameranın en üst %12'lik filigran/yazı alanını siyaha boya
-            h_f, w_f = frame.shape[:2]
-            frame[0:int(h_f * 0.12), 0:w_f] = (0, 0, 0)
-
-            simdi = time.time()
-            if simdi - son_gonderim_zamani < 0.05:  # 20 FPS sınırlayıcı
-                continue
-            son_gonderim_zamani = simdi
-
-            ai_device = 0 if torch.cuda.is_available() else "cpu"
-
-            # 🚗 ADIM 1: Önce araç/insan tespiti yap (filtreleme) — kilit altında
-            with INFERENCE_LOCK:
-                detection_results = detection_model(frame, device=ai_device, verbose=False, conf=0.5)
-
-            # İnsan algılandıysa bu kareyi atla (plaka işleme yapma)
-            insan_bulundu = False
-            arac_tipi = "bilinmiyor"
-            arac_kutusu = None  # 🆕 plaka aramasını araç kutusuyla sınırlamak için
-
-            for det_result in detection_results:
-                det_boxes = det_result.boxes
-                for det_box in det_boxes:
-                    class_id = int(det_box.cls[0])
-
-                    if class_id == 0:  # İnsan
-                        insan_bulundu = True
-                        break
-
-                    if class_id in COCO_CLASSES and class_id != 0:
-                        arac_tipi = COCO_CLASSES[class_id]
-                        axyxy = det_box.xyxy[0].cpu().numpy()
-                        arac_kutusu = tuple(map(int, axyxy))
-
-                if insan_bulundu:
-                    break
-
-            # İnsan varsa bu kareyi işleme
-            if insan_bulundu:
-                continue
-
-            # 🔍 ADIM 2: Plaka tespiti. Araç kutusu bulunduysa aramayı ona (paylı)
-            # kısıtlıyoruz — plaka oransal olarak büyür (OCR ↑) ve arka plan
-            # false-positive'leri elenir. Araç kutusu yoksa tüm karede ararız (fallback).
-            arama_karesi = frame
-            ofset_x, ofset_y = 0, 0
-            if arac_kutusu is not None:
-                ax1, ay1, ax2, ay2 = arac_kutusu
-                pay = int((ay2 - ay1) * 0.15)
-                ax1 = max(0, ax1 - pay)
-                ay1 = max(0, ay1 - pay)
-                ax2 = min(frame.shape[1], ax2 + pay)
-                ay2 = min(frame.shape[0], ay2 + pay)
-                if ax2 > ax1 and ay2 > ay1:
-                    arama_karesi = frame[ay1:ay2, ax1:ax2]
-                    ofset_x, ofset_y = ax1, ay1
-
-            with INFERENCE_LOCK:
-                results = model(arama_karesi, device=ai_device, verbose=False,
-                                conf=PLAKA_CONF_ESIGI, imgsz=PLAKA_IMGSZ)
-
-            plaka_bulundu_bu_karede = False
-            en_iyi_kutu = None
-            en_buyuk_alan = 0
-
-            for result in results:
-                boxes = result.boxes
-                for box in boxes:
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    # 🆕 Aramayı araç kutusuna kısıtladıysak, koordinatları tam kareye offsetle
-                    x1, y1, x2, y2 = map(int, xyxy)
-                    x1, y1, x2, y2 = x1 + ofset_x, y1 + ofset_y, x2 + ofset_x, y2 + ofset_y
-
-                    genislik = x2 - x1
-                    yukseklik = y2 - y1
-                    alan = genislik * yukseklik
-
-                    if genislik < 20 or yukseklik < 20:
-                        continue
-
-                    plaka_bulundu_bu_karede = True
-                    if alan > en_buyuk_alan:
-                        en_buyuk_alan = alan
-                        # 📐 YOLO bounding box'ını genişlet (padding = yüksekliğin %20'si)
-                        bbox_yukseklik = y2 - y1
-                        padding = int(bbox_yukseklik * 0.2)
-                        x1_padded = max(0, x1 - padding)
-                        y1_padded = max(0, y1 - padding)
-                        x2_padded = min(frame.shape[1], x2 + padding)
-                        y2_padded = min(frame.shape[0], y2 + padding)
-                        en_iyi_kutu = (x1_padded, y1_padded, x2_padded, y2_padded)
-
-            # 🚀 AKILLI TAMPON MANTIĞI
-            if plaka_bulundu_bu_karede and en_iyi_kutu is not None:
-                x1, y1, x2, y2 = en_iyi_kutu
-                cropped_plate = frame[y1:y2, x1:x2]
-
-                if cropped_plate.size > 0:
-                    if not arac_algilandi_mi:
-                        # 🧊 Cooldown: bu konum kısa süre önce işlediğimiz kutuyla büyük
-                        # ölçüde örtüşüyorsa (sabit nesne), tekrar işlemeyi atla
-                        simdiki_kutu = (x1, y1, x2, y2)
-                        if (son_islenen_kutu is not None
-                                and (time.time() - son_islenen_zaman) < COOLDOWN_SANIYE
-                                and kutu_ortusme_orani(simdiki_kutu, son_islenen_kutu) > COOLDOWN_IOU_ESIGI):
-                            continue  # aynı nesne muhtemelen hâlâ orada, atla
-
-                        arac_algilandi_mi = True
-                        arac_baslangic_zamani = time.time()
-                        kare_havuzu = []
-                        episode_junk_kelimeleri = set()
-                        episode_temsili_kare = None
-                        episode_temsili_alan = 0
-                        episode_arac_tipi = arac_tipi  # 🚗 Bu episode'daki araç tipini sakla
-                        logger.info(f"🚗 Araç algılandı ({arac_tipi}). Kadrajda kaldığı sürece kare toplanıyor...")
-
-                    # Her tespitte "son görülme zamanı"nı güncelle (araç hâlâ kadrajda)
-                    son_tespit_zamani = time.time()
-                    episod_kutu = (x1, y1, x2, y2)
-
-                    # 📸 Keskinlik filtresi: motion blur'lu kareleri atla
-                    kare_keskinligi = keskinlik_skoru(cropped_plate)
-                    if kare_keskinligi < 100:  # Çok bulanık → atla
-                        logger.debug(f"   🏃 [Blur Filtresi] Kare çok bulanık (keskinlik={kare_keskinligi:.1f}), atlandı.")
-                    else:
-                        kare_havuzu.append({
-                            "gorsel": cropped_plate,
-                            "alan": en_buyuk_alan,
-                            "keskinlik": kare_keskinligi,
-                        })
-
-                        # 🚗 Araç görseli: en büyük plakalı NET kareyi temsili kabul et
-                        # (bulanık kareler seçilmesin diye blur filtresinin İÇİNDE).
-                        # Üstüne YOLO kutusunu çizip episode'un "araç kanıtı" görselini sakla.
-                        if en_buyuk_alan > episode_temsili_alan:
-                            episode_temsili_alan = en_buyuk_alan
-                            temsili = frame.copy()
-                            cv2.rectangle(temsili, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                            episode_temsili_kare = temsili
-
-                    # 🐞 Teşhis modu açıksa, YOLO'nun kırptığı HAM görüntüyü diske kaydet
-                    if DEBUG_KARE_KAYDET:
-                        debug_dosya_adi = f"kam{kamera_id}_{int(time.time() * 1000)}.jpg"
-                        cv2.imwrite(os.path.join(DEBUG_KARE_DIR, debug_dosya_adi), cropped_plate)
-
-            # 🏁 EPISODE SONLANDIRMA: araç gerçekten ayrıldı ya da azami süre doldu
-            if arac_algilandi_mi:
-                simdi2 = time.time()
-                arac_ayrildi_mi = (simdi2 - son_tespit_zamani) >= ARAC_AYRILMA_BOSLUGU
-                zaman_asimi_mi = (simdi2 - arac_baslangic_zamani) >= MAKS_TOPLAMA_SANIYESI
-
-                if arac_ayrildi_mi or zaman_asimi_mi:
-                    sebep = "araç kadrajdan ayrıldı" if arac_ayrildi_mi else "azami toplama süresi doldu (araç hâlâ kadrajda olabilir)"
-                    logger.info(f"⏱️ Toplama tamamlandı ({sebep}). Toplam {len(kare_havuzu)} kare arasından en net olanı analiz ediliyor...")
-
-                    if len(kare_havuzu) < MIN_ISLEME_KARE_SAYISI:
-                        logger.info(f"⚠️ Sadece {len(kare_havuzu)} kare toplandı (min {MIN_ISLEME_KARE_SAYISI}) — muhtemelen anlık yanlış algılama, OCR'a sokulmuyor.")
-                    else:
-                        # 🎯 Boyut + netlik (Laplacian) karışık skoruna göre en iyi kareler
-                        max_alan = max(k["alan"] for k in kare_havuzu) or 1
-                        max_keskinlik = max(k["keskinlik"] for k in kare_havuzu) or 1
-                        for k in kare_havuzu:
-                            k["skor"] = 0.5 * (k["alan"] / max_alan) + 0.5 * (k["keskinlik"] / max_keskinlik)
-
-                        kare_havuzu.sort(key=lambda x: x["skor"], reverse=True)
-                        EN_IYI_KARE_SAYISI = 5
-                        en_iyi_kareler = [item["gorsel"] for item in kare_havuzu[:EN_IYI_KARE_SAYISI]]
-
-                        # 🐞 Orijinal kare teşhis modu: episode'un temsili tam karesini kaydet
-                        if DEBUG_ORIJINAL_KARE_KAYDET and episode_temsili_kare is not None:
-                            debug_dosya_adi = f"kam{kamera_id}_{yon}_{int(time.time() * 1000)}.jpg"
-                            cv2.imwrite(os.path.join(DEBUG_ORIJINAL_KARE_DIR, debug_dosya_adi), episode_temsili_kare)
-                            logger.info(f"🐞 [Orijinal Kare] Tam kare (YOLO kutusu çizili) kaydedildi: {debug_dosya_adi}")
-
-                        # Her kareden en iyi adayı topla; sonra karakter-bazlı oylamaya sok
-                        tum_adaylar = []
-                        # 🖼️ Backend'e gönderilecek kırpılmış plaka "kanıtı" (en net + en büyük)
-                        en_iyi_gonderim_goruntusu = kare_havuzu[0]["gorsel"] if kare_havuzu else None
-
-                        for idx, best_crop in enumerate(en_iyi_kareler):
-                            # Teşhis için son görsel referansını bu KAMERAYA özel güncelle
-                            son_yakalanan_goruntuler[kamera_id] = best_crop.copy()
-
-                            plaka, ortalama_guven, ham_parcalar = kareyi_oku(best_crop)
-
-                            if not ham_parcalar:
-                                logger.info(f"🔍 [Kare {idx+1} Analizi] Hiçbir varyantta metin okunamadı.")
-                            else:
-                                for (v_idx, text, prob) in ham_parcalar:
-                                    logger.debug(f"🔍 [Kare {idx+1} / Varyant {v_idx+1} Ham Parça] '{text}' (Güven: {prob:.2f})")
-
-                                    # 🧠 Tek başına geçerli plaka olmayan ama harf içeren,
-                                    # yeterince uzun parça — otomatik kara liste adayı
-                                    temiz_kelime = plaka_temizle(text)
-                                    if (temiz_kelime and len(temiz_kelime) >= 4
-                                            and any(karakter.isalpha() for karakter in temiz_kelime)
-                                            and not plaka_format_gecerli_mi(temiz_kelime)):
-                                        episode_junk_kelimeleri.add(temiz_kelime)
-
-                            if plaka is None:
-                                logger.info(f"⚠️ [Kare {idx+1}] Geçerli formatta plaka bulunamadı.")
-                                continue
-
-                            logger.info(f"   -> [Kare {idx+1}] Aday: '{plaka}' (Ort. Güven: {ortalama_guven:.2f})")
-                            tum_adaylar.append((plaka, ortalama_guven))
-
-                        # 🧠 Episode'da tekrar eden "sabit metin" adaylarını sayaca işle
-                        if episode_junk_kelimeleri:
-                            episode_junk_kelimelerini_degerlendir(episode_junk_kelimeleri)
-
-                        # 🗳️ Tüm karelerin adaylarını karakter-bazlı oylamayla birleştir
-                        genel_en_iyi_plaka, genel_en_iyi_guven = oylama_ile_konsensus(tum_adaylar)
-
-                        if genel_en_iyi_plaka is not None and len(tum_adaylar) > 1:
-                            logger.info(f"🗳️ [Konsensüs] {len(tum_adaylar)} aday arasından oylama sonucu: '{genel_en_iyi_plaka}' (Güven: {genel_en_iyi_guven:.2f})")
-
-                        # 🧠 Hafıza düzeltmesi: bilinen bir yanlış okumaya benziyor mu?
-                        if genel_en_iyi_plaka is not None:
-                            duzeltilmis_plaka, hafizadan_geldi_mi = hafizadan_duzelt(genel_en_iyi_plaka)
-                            if hafizadan_geldi_mi and duzeltilmis_plaka != genel_en_iyi_plaka:
-                                logger.info(f"🧠 [HAFIZA DÜZELTMESİ] '{genel_en_iyi_plaka}' -> '{duzeltilmis_plaka}' (geçmiş bir düzeltmeye göre otomatik değiştirildi)")
-                                genel_en_iyi_plaka = duzeltilmis_plaka
-                                genel_en_iyi_guven = max(genel_en_iyi_guven, 0.90)
-
-                        MIN_GUVEN_ESIGI = 0.35  # 📉 Toleranslı
-
-                        simdi3 = time.time()
-                        if genel_en_iyi_plaka is None:
-                            logger.info("⚠️ Bu araç için hiçbir karede geçerli formatta plaka bulunamadı.")
-                        elif genel_en_iyi_guven < MIN_GUVEN_ESIGI:
-                            logger.info(f"⚠️ En iyi aday '{genel_en_iyi_plaka}' düşük güven skoru yüzünden elendi ({genel_en_iyi_guven:.2f}).")
-                        elif (genel_en_iyi_plaka in gonderilen_plakalar
-                              and (simdi3 - gonderilen_plakalar[genel_en_iyi_plaka]) < PLAKA_TEKRAR_PENCERESI):
-                            logger.info(f"⚠️ [Filtre] '{genel_en_iyi_plaka}' son {PLAKA_TEKRAR_PENCERESI:.0f}sn içinde gönderildi, tekrar gönderilmiyor.")
-                        else:
-                            gonderilen_plakalar[genel_en_iyi_plaka] = simdi3
-                            son_okunan_plaka_global = genel_en_iyi_plaka
-                            logger.info(f"🎯 [{yon.upper()}] Doğrulanmış Plaka Okundu! -> {genel_en_iyi_plaka} (Ort. Güven: {genel_en_iyi_guven:.2f})")
-
-                            # 🖼️ Araç görselini diske yaz + erişilebilir image_url üret
-                            arac_gorseli = episode_temsili_kare if episode_temsili_kare is not None else en_iyi_gonderim_goruntusu
-                            image_url = None
-                            if arac_gorseli is not None:
-                                image_url, _ = gorsel_kaydet_ve_url_uret(arac_gorseli, kamera_id, genel_en_iyi_plaka)
-
-                            # base64 (opsiyonel — GORSEL_BASE64_GONDER=true ise)
-                            plaka_gorseli_b64 = None
-                            tam_kare_b64 = None
-                            if GORSEL_BASE64_GONDER:
-                                if en_iyi_gonderim_goruntusu is not None:
-                                    plaka_gorseli_b64 = gorseli_base64_kodla(en_iyi_gonderim_goruntusu)
-                                if episode_temsili_kare is not None:
-                                    tam_kare_b64 = gorseli_base64_kodla(episode_temsili_kare)
-
-                            veri_paketi = PlakaVeriPaketi(
-                                kamera_id=kamera_id,
-                                depo_id=depo_id,
-                                yon=yon,
-                                plaka_metni=genel_en_iyi_plaka,
-                                arac_tipi=episode_arac_tipi,  # 🚗 Araç tipi ekle
-                                guven_skoru=float(genel_en_iyi_guven),
-                                tarih_saat=datetime.now(timezone.utc).isoformat(),
-                                image_url=image_url,
-                                plaka_gorseli_base64=plaka_gorseli_b64,
-                                tam_kare_gorseli_base64=tam_kare_b64,
-                            )
-
-                            send_plate_to_backend_sync(veri_paketi)
-
-                    # 🧊 Bu episode'u işledik (başarılı olsun olmasın) — cooldown için kaydet
-                    if episod_kutu is not None:
-                        son_islenen_kutu = episod_kutu
-                        son_islenen_zaman = time.time()
-
-                    arac_algilandi_mi = False
-                    kare_havuzu = []
-                    episod_kutu = None
-                    episode_junk_kelimeleri = set()
-                    episode_temsili_kare = None
-                    episode_temsili_alan = 0
-
-        except Exception as e:
-            logger.exception(f"💥 [{yon.upper()}] Kamera {kamera_id} kare işleme sırasında beklenmeyen hata (thread yaşıyor, sonraki kareye geçiliyor): {e}")
-            continue
-
-    cap.release()
-
-
-# --- 🎛️ ENDPOINTS ---
+# ==========================================================================
+# 🎛️ ENDPOINTS
+# ==========================================================================
 @app.get("/")
 async def root():
-    return {"durum": "AI Servisi Canlı Akış Modunda Ayakta"}
+    return {"durum": "AI Servisi Canlı Akış Modunda Ayakta", "surum": "2.0"}
 
 
-@app.get("/healthz")
-async def healthz():
-    """ Canlılık kontrolü (Docker healthcheck / LB için) — auth gerektirmez. """
-    return {"status": "ok"}
+@app.get("/api/v1/loglar")
+async def loglar(limit: int = 200):
+    """Son log satırlarını döner (canlı izleme için /loglar sayfasını kullan)."""
+    with _log_kilit:
+        kayitlar = list(LOG_TAMPONU)[-limit:]
+    return {"toplam": len(kayitlar), "loglar": kayitlar}
 
 
-@app.get("/readyz")
-async def readyz():
-    """ Hazırlık kontrolü: modeller yüklü + en az bir kamera thread'i canlı mı? """
-    modeller_hazir = (model is not None and detection_model is not None and reader is not None)
-    canli_threadler = [t.name for t in AKTIF_THREADLER if t.is_alive()]
-    hazir = modeller_hazir and len(canli_threadler) > 0
-    return JSONResponse(
-        status_code=200 if hazir else 503,
-        content={
-            "hazir": hazir,
-            "modeller_hazir": modeller_hazir,
-            "canli_kamera_threadleri": canli_threadler,
-        },
-    )
+@app.get("/api/v1/loglar/canli")
+async def loglar_canli():
+    """
+    Server-Sent Events ile canlı log akışı.
+    Kullanım:  curl -N http://localhost:8000/api/v1/loglar/canli
+    """
+    async def uret():
+        with _log_kilit:
+            mevcut = list(LOG_TAMPONU)[-50:]
+        son_id = -1
+        for kayit in mevcut:
+            son_id = kayit["id"]
+            yield f"data: {json.dumps(kayit, ensure_ascii=False)}\n\n"
+        while True:
+            with _log_kilit:
+                yeniler = [k for k in LOG_TAMPONU if k["id"] > son_id]
+            for kayit in yeniler:
+                son_id = kayit["id"]
+                yield f"data: {json.dumps(kayit, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(0.4)
+
+    return StreamingResponse(uret(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/loglar", response_class=HTMLResponse)
+async def loglar_sayfasi():
+    """Tarayıcıdan canlı log izleme sayfası — http://<sunucu>:8000/loglar"""
+    return """<!doctype html><html lang="tr"><head><meta charset="utf-8">
+<title>Plaka AI — Canlı Log</title>
+<style>
+ body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:16px}
+ h1{font-size:15px;color:#58a6ff;margin:0 0 12px}
+ #kutu{white-space:pre-wrap;word-break:break-word}
+ .satir{padding:1px 0;border-bottom:1px solid #161b22}
+ .zaman{color:#6e7681;margin-right:8px}
+ .basari{color:#3fb950;font-weight:600}
+ .uyari{color:#d29922}
+ .hata{color:#f85149}
+ .ayrinti{color:#8b949e}
+ #durum{position:fixed;top:12px;right:16px;font-size:11px;color:#6e7681}
+</style></head><body>
+<h1>🚗 Plaka Tanıma — Canlı Log</h1><div id="durum">bağlanıyor…</div><div id="kutu"></div>
+<script>
+ const kutu=document.getElementById('kutu'), durum=document.getElementById('durum');
+ const es=new EventSource('/api/v1/loglar/canli');
+ es.onopen=()=>durum.textContent='● canlı';
+ es.onerror=()=>durum.textContent='○ bağlantı koptu';
+ es.onmessage=e=>{
+   const k=JSON.parse(e.data);
+   const d=document.createElement('div');
+   d.className='satir '+(k.tur||'');
+   d.innerHTML='<span class="zaman">'+k.zaman+'</span>'+k.mesaj.replace(/</g,'&lt;');
+   kutu.appendChild(d);
+   while(kutu.childNodes.length>1500) kutu.removeChild(kutu.firstChild);
+   window.scrollTo(0,document.body.scrollHeight);
+ };
+</script></body></html>"""
 
 
 @app.post("/api/v1/plaka/duzelt")
 async def plaka_duzelt(istek: PlakaDuzeltmeIstek):
-    """
-    Güvenlik görevlisi hatalı plakayı düzelttiğinde tetiklenen webhook:
-    1) Son yakalanan görseli doğru etiketle diske kaydeder (retrain veri seti).
-    2) Düzeltmeyi hafıza dosyasına yazar (benzer okumalar otomatik düzeltilsin).
-    """
-    global son_yakalanan_goruntuler, DUZELTME_HAFIZASI
+    """Güvenlik görevlisi hatalı okumayı düzeltince: veri setine kaydet + hafızaya yaz."""
+    global DUZELTME_HAFIZASI
     try:
         gorsel = son_yakalanan_goruntuler.get(istek.kamera_id)
         if gorsel is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Kamera {istek.kamera_id} için diske yazılacak son aktif görsel bulunamadı."
-            )
+            raise HTTPException(status_code=400,
+                                detail=f"Kamera {istek.kamera_id} için son görsel bulunamadı.")
 
-        yanlis_plaka_temiz = plaka_temizle(istek.yanlis_plaka)
-        dogru_plaka_temiz = plaka_temizle(istek.dogru_plaka)
+        yanlis = plaka_temizle(istek.yanlis_plaka)
+        dogru = plaka_temizle(istek.dogru_plaka)
 
-        dosya_adi = f"kam{istek.kamera_id}_{dogru_plaka_temiz}_{int(time.time())}.jpg"
-        hedef_yol = os.path.join(RETRAIN_DIR, dosya_adi)
+        dosya_adi = f"kam{istek.kamera_id}_{dogru}_{int(time.time())}.jpg"
+        cv2.imwrite(os.path.join(RETRAIN_DIR, dosya_adi), gorsel)
 
-        cv2.imwrite(hedef_yol, gorsel)
-        logger.info(f"💾 [VERİ SETİ] Görsel kaydedildi: {hedef_yol} ({yanlis_plaka_temiz} -> {dogru_plaka_temiz})")
-
-        # 🧠 Self-learning: hafızaya ekle ve kalıcı dosyaya yaz
-        DUZELTME_HAFIZASI[yanlis_plaka_temiz] = dogru_plaka_temiz
+        DUZELTME_HAFIZASI[yanlis] = dogru
         duzeltme_hafizasini_kaydet(DUZELTME_HAFIZASI)
-        logger.info(f"🧠 [ÖĞRENME] Hafızaya eklendi: '{yanlis_plaka_temiz}' -> '{dogru_plaka_temiz}' (toplam {len(DUZELTME_HAFIZASI)} kayıt)")
+        log(f"🧠 [ÖĞRENME] '{yanlis}' → '{dogru}' (toplam {len(DUZELTME_HAFIZASI)} kayıt)")
 
-        return {
-            "durum": "basarili",
-            "mesaj": f"Görsel '{dogru_plaka_temiz}' etiketiyle veri setine eklendi ve düzeltme hafızaya kaydedildi.",
-            "toplam_hafiza_kaydi": len(DUZELTME_HAFIZASI)
-        }
+        return {"durum": "basarili",
+                "mesaj": f"'{dogru}' etiketiyle kaydedildi ve hafızaya alındı.",
+                "toplam_hafiza_kaydi": len(DUZELTME_HAFIZASI)}
     except HTTPException:
         raise
     except Exception as e:
@@ -1172,108 +1870,128 @@ async def plaka_duzelt(istek: PlakaDuzeltmeIstek):
 
 @app.get("/api/v1/plaka/duzeltme-hafizasi")
 async def duzeltme_hafizasi_goruntule():
-    """ Öğrenilmiş düzeltmelerin tamamını döner (izleme/teşhis amaçlı) """
-    return {
-        "toplam_kayit": len(DUZELTME_HAFIZASI),
-        "hafiza": DUZELTME_HAFIZASI
-    }
+    return {"toplam_kayit": len(DUZELTME_HAFIZASI), "hafiza": DUZELTME_HAFIZASI}
 
 
 @app.delete("/api/v1/plaka/duzeltme-hafizasi/{yanlis_plaka}")
 async def duzeltme_hafizasindan_sil(yanlis_plaka: str):
-    """ Hatalı girilmiş bir düzeltme kaydını hafızadan siler """
-    global DUZELTME_HAFIZASI
-    yanlis_plaka_temiz = plaka_temizle(yanlis_plaka)
-    if yanlis_plaka_temiz not in DUZELTME_HAFIZASI:
+    temiz = plaka_temizle(yanlis_plaka)
+    if temiz not in DUZELTME_HAFIZASI:
         raise HTTPException(status_code=404, detail="Bu plaka hafızada bulunamadı.")
-    silinen = DUZELTME_HAFIZASI.pop(yanlis_plaka_temiz)
+    silinen = DUZELTME_HAFIZASI.pop(temiz)
     duzeltme_hafizasini_kaydet(DUZELTME_HAFIZASI)
-    return {"durum": "basarili", "mesaj": f"'{yanlis_plaka_temiz} -> {silinen}' kaydı silindi."}
+    return {"durum": "basarili", "mesaj": f"'{temiz} -> {silinen}' silindi."}
 
 
 @app.get("/api/v1/plaka/kara-liste")
 async def kara_liste_goruntule():
-    """ Sabit + otomatik kara listeyi ve takip edilen adayların sayaçlarını döner. """
     return {
-        "sabit_kara_liste": sorted(YASAKLI_KELIMELER),
-        "otomatik_kara_liste": sorted(OTO_YASAKLI_KELIMELER),
-        "takip_edilen_adaylar": OTO_KELIME_SAYAC,
-        "esik": OTO_KARA_LISTE_ESIK,
+        "kara_liste": sorted(KARA_LISTE),
+        "not": ("Otomatik öğrenme KALDIRILDI — gerçek plaka parçalarını "
+                "yasakladığı için doğruluğu düşürüyordu. Bu liste yalnızca elle "
+                "yönetilir ve TAM EŞLEŞME ile çalışır."),
     }
 
 
 @app.post("/api/v1/plaka/kara-liste/{kelime}")
-async def kara_listeye_manuel_ekle(kelime: str):
-    """ Eşiği beklemeden bir kelimeyi anında otomatik kara listeye ekler. """
-    global OTO_YASAKLI_KELIMELER
-    temiz_kelime = plaka_temizle(kelime)
-    if not temiz_kelime or len(temiz_kelime) < 2:
-        raise HTTPException(status_code=400, detail="Geçerli bir kelime girmelisin.")
-    OTO_YASAKLI_KELIMELER.add(temiz_kelime)
-    OTO_KELIME_SAYAC[temiz_kelime] = OTO_KARA_LISTE_ESIK
-    oto_kara_listesini_kaydet()
-    return {"durum": "basarili", "mesaj": f"'{temiz_kelime}' kara listeye eklendi.", "toplam_otomatik": len(OTO_YASAKLI_KELIMELER)}
+async def kara_listeye_ekle(kelime: str):
+    temiz = plaka_temizle(kelime)
+    if not temiz or len(temiz) < 3:
+        raise HTTPException(status_code=400, detail="En az 3 karakterlik bir metin girmelisin.")
+    if plaka_format_gecerli_mi(temiz):
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{temiz}' geçerli bir TR plaka formatında — kara listeye eklenemez. "
+                   "Bu koruma, sistemin gerçek plakaları yasaklamasını önler.")
+    KARA_LISTE.add(temiz)
+    kara_listeyi_kaydet()
+    return {"durum": "basarili", "mesaj": f"'{temiz}' kara listeye eklendi.", "toplam": len(KARA_LISTE)}
 
 
 @app.delete("/api/v1/plaka/kara-liste/{kelime}")
 async def kara_listeden_sil(kelime: str):
-    """ Otomatik öğrenilen kara listeden bir kelimeyi siler (sabit liste silinemez). """
-    global OTO_YASAKLI_KELIMELER, OTO_KELIME_SAYAC
-    temiz_kelime = plaka_temizle(kelime)
-    if temiz_kelime in YASAKLI_KELIMELER:
-        raise HTTPException(status_code=400, detail="Bu kelime kodda sabit olarak tanımlı, API üzerinden silinemez.")
-    if temiz_kelime not in OTO_YASAKLI_KELIMELER:
-        raise HTTPException(status_code=404, detail="Bu kelime otomatik kara listede bulunamadı.")
-    OTO_YASAKLI_KELIMELER.discard(temiz_kelime)
-    OTO_KELIME_SAYAC.pop(temiz_kelime, None)
-    oto_kara_listesini_kaydet()
-    return {"durum": "basarili", "mesaj": f"'{temiz_kelime}' otomatik kara listeden silindi."}
+    temiz = plaka_temizle(kelime)
+    if temiz not in KARA_LISTE:
+        raise HTTPException(status_code=404, detail="Bu kelime kara listede bulunamadı.")
+    KARA_LISTE.discard(temiz)
+    kara_listeyi_kaydet()
+    return {"durum": "basarili", "mesaj": f"'{temiz}' silindi."}
+
+
+@app.get("/api/v1/plaka/test/{metin}")
+async def plaka_cozumleyici_test(metin: str):
+    """
+    Gramer çözümleyicisini elle test etmek için.
+    Örn: /api/v1/plaka/test/B4CLY063  ->  34CLY063
+    """
+    temiz = plaka_temizle(metin)
+    plaka, skor = plaka_cozumle(temiz, 1.0)
+    return {
+        "girdi": metin, "temizlenmis": temiz,
+        "cozumlenen_plaka": plaka, "skor": round(skor, 3),
+        "dogrudan_gecerli_mi": plaka_format_gecerli_mi(temiz),
+    }
 
 
 @app.post("/api/v1/kamera/baslat")
-async def kamera_baslat(istek: KameraIstek, background_tasks: BackgroundTasks):
-    """
-    Manuel/ad-hoc kamera başlatma. Gebze giriş/çıkış kameraları için gerek YOK
-    (onlar servis ayağa kalkınca otomatik başlar). Bu endpoint yeni/test kameraları için.
-    """
-    try:
-        if not istek.rtsp_url or istek.rtsp_url == "string":
-            raise HTTPException(status_code=400, detail="Geçerli bir RTSP URL'si girmelisin!")
-
-        logger.info(f"🎥 Kamera {istek.kamera_id} için gerçek akış başlatma emri alındı.")
-        background_tasks.add_task(
-            gercek_yolo_ocr_pipeline,
-            istek.kamera_id, istek.depo_id, istek.rtsp_url, istek.yon
-        )
-
-        return {
-            "durum": "basarili",
-            "mesaj": f"{istek.kamera_id} numaralı kamera için GERÇEK AI Pipeline arka planda tetiklendi."
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def kamera_baslat(istek: KameraIstek):
+    if not istek.rtsp_url or istek.rtsp_url == "string":
+        raise HTTPException(status_code=400, detail="Geçerli bir RTSP URL'si girmelisin!")
+    thread = threading.Thread(
+        target=gercek_yolo_ocr_pipeline,
+        args=(istek.kamera_id, istek.depo_id, istek.rtsp_url, istek.yon),
+        daemon=True, name=f"kamera-{istek.kamera_id}")
+    thread.start()
+    return {"durum": "basarili",
+            "mesaj": f"{istek.kamera_id} numaralı kamera arka planda başlatıldı."}
 
 
 @app.get("/api/v1/kamera/durum")
 async def kamera_durum():
-    """ Otomatik başlatılan sabit kameraların listesini ve durumunu döner """
+    with _durum_kilit:
+        canli = dict(KAMERA_DURUMLARI)
     return {
-        "otomatik_baslatilan_kameralar": [
-            {
-                "kamera_id": k["kamera_id"],
-                "isim": k["isim"],
-                "yon": k["yon"],
-                "depo_id": k["depo_id"],
-            }
+        "kameralar": [
+            {"kamera_id": k["kamera_id"], "isim": k["isim"], "yon": k["yon"],
+             "depo_id": k["depo_id"], "canli_durum": canli.get(k["kamera_id"], {})}
             for k in GEBZE_KAMERALARI
-        ]
+        ],
+        "ayarlar": {
+            "rtsp_profil": RTSP_PROFIL,
+            "min_plaka_guveni": MIN_PLAKA_GUVENI,
+            "min_mutabakat_kare": MIN_MUTABAKAT_KARE,
+            "plaka_arac_zorunlu": PLAKA_ARAC_ZORUNLU,
+            "log_seviyesi": LOG_SEVIYESI,
+        },
     }
 
 
+@app.get("/healthz")
+async def healthz():
+    """Canlılık: süreç ayakta mı?"""
+    return {"durum": "canli"}
+
+
+@app.get("/readyz")
+async def readyz():
+    """
+    Hazırlık: modeller yüklendi mi ve en az bir kamera thread'i çalışıyor mu?
+    Kamera thread'i ölmüşse burası 503 döner — sessiz ölümü görünür kılar.
+    """
+    canli_threadler = [t.name for t in AKTIF_THREADLER if t.is_alive()]
+    hazir = bool(canli_threadler)
+    icerik = {
+        "durum": "hazir" if hazir else "hazir_degil",
+        "modeller_yuklendi": True,
+        "canli_kamera_threadleri": canli_threadler,
+        "toplam_kamera_threadi": len(AKTIF_THREADLER),
+    }
+    if not hazir:
+        raise HTTPException(status_code=503, detail=icerik)
+    return icerik
+
+
 if __name__ == "__main__":
-    # ⚠️ reload=True KASTEN KAPALI: uygulama çalışırken dataset/debug/captures
-    # klasörlerine dosya yazıyoruz; reload bunu "kod değişti" sanıp uygulamayı
-    # yeniden başlatır ve kamera thread'lerini öldürür. Üretimde reload KAPALI olmalı.
+    # ⚠️ reload=True KULLANMA: uygulama çalışırken dataset/debug klasörlerine
+    # dosya yazıyoruz; reload bunu "kod değişti" sanıp kamera thread'lerini öldürür.
     uvicorn.run("main:app", host="0.0.0.0", port=8000)

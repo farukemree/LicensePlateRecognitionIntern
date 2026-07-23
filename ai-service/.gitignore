@@ -1,0 +1,18 @@
+# Model ağırlıkları (yolov8m.pt ~52MB — repoya girmemeli, ilk çalıştırmada iner)
+yolov8m.pt
+*.onnx
+
+# Model önbellekleri
+.easyocr/
+.ultralytics/
+
+# Çalışma zamanı çıktıları
+__pycache__/
+*.pyc
+captures/
+debug_kareler/
+debug_ocr/
+dataset/
+
+# Ortam dosyası (şifre içerir — .env.example takip edilir)
+.env

@@ -28,6 +28,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Yapay zeka modellerinin Docker her açıldığında sıfordat inmesini engellemek için önbellek dizinleri
 ENV YOLO_CONFIG_DIR=/app/.ultralytics
 ENV EASYOCR_MODULE_DATA_DIR=/app/.easyocr
+# 🩹 Canlı log akışı için: Python'un stdout/stderr'i bloklar halinde değil
+# satır satır anında flush etmesini garanti eder (bkz. main.py'deki
+# sys.stdout.reconfigure ile aynı amaç, iki katmanlı güvence).
+ENV PYTHONUNBUFFERED=1
 ENV CUDA_HOME=/usr/local/cuda
 ENV LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ENV PATH=$CUDA_HOME/bin:$PATH
