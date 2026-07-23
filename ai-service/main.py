@@ -787,6 +787,72 @@ def _hedef_boyuta_olcekle(bgr):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
 
+def plaka_egimini_duzelt(crop_bgr):
+    """
+    Plakanın eğimini bulup düzeltir (deskew). Bulunamazsa None.
+
+    📊 NEDEN: Sahadaki hataların ezici çoğunluğu İL KODUNDA yoğunlaşıyordu
+    (34↔14↔61↔04↔81); gövde neredeyse her zaman doğru okunuyordu. Sebebi
+    şu: kamera plakaya açıyla baktığı için perspektif SOL kenarı sıkıştırıyor
+    ve il kodu tam orada duruyor. Eğim düzeltilince o sıkışma azalıyor.
+
+    ⚠️ TAM perspektif (4 köşe + warpPerspective) denendi ve ÇOK DAHA KÖTÜ
+    çıktı: tam plaka doğruluğu %62 -> %39. Dört köşe tespiti güvenilmez,
+    yanlış dörtgen bulunca görüntüyü tamamen bozuyor. Sadece DÖNDÜRME
+    (minAreaRect) kullanılıyor; ölçüm: %62 -> %70, orijinalle birlikte
+    denenince %72.
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    h, w = crop_bgr.shape[:2]
+    if h < 20 or w < 40:
+        return None
+    try:
+        gri = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        gri = cv2.bilateralFilter(gri, 9, 75, 75)
+        _, esik = cv2.threshold(gri, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Karakter boşluklarını kapat ki plaka tek bir blok olsun
+        cekirdek = cv2.getStructuringElement(cv2.MORPH_RECT,
+                                             (max(5, w // 12), max(3, h // 10)))
+        kapali = cv2.morphologyEx(esik, cv2.MORPH_CLOSE, cekirdek)
+        konturlar, _ = cv2.findContours(kapali, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not konturlar:
+            return None
+        kontur = max(konturlar, key=cv2.contourArea)
+        if cv2.contourArea(kontur) < w * h * 0.15:
+            return None
+
+        (cx, cy), (rw, rh), aci = cv2.minAreaRect(kontur)
+        if rw < rh:
+            rw, rh = rh, rw
+            aci += 90
+        # Plaka gibi durmuyorsa ya da açı saçmaysa dokunma
+        if rh < 10 or not (1.5 <= rw / rh <= 8) or abs(aci) > 30:
+            return None
+
+        donus = cv2.getRotationMatrix2D((cx, cy), aci, 1.0)
+        dondurulmus = cv2.warpAffine(crop_bgr, donus, (w, h),
+                                     flags=cv2.INTER_CUBIC,
+                                     borderMode=cv2.BORDER_REPLICATE)
+        x1, y1 = max(0, int(cx - rw / 2)), max(0, int(cy - rh / 2))
+        x2, y2 = min(w, int(cx + rw / 2)), min(h, int(cy + rh / 2))
+        if x2 - x1 < 40 or y2 - y1 < 12:
+            return None
+        kirpilmis = dondurulmus[y1:y2, x1:x2]
+        return kirpilmis if kirpilmis.size > 0 else None
+    except Exception:
+        return None
+
+
+def _varyant_seti(crop_bgr, clahe) -> List:
+    """Tek bir kırpma için gri / CLAHE / keskin varyantlarını üretir."""
+    gri = _hedef_boyuta_olcekle(crop_bgr)
+    clahe_gri = clahe.apply(gri)
+    bulanik = cv2.GaussianBlur(clahe_gri, (0, 0), sigmaX=2.0)
+    keskin = cv2.addWeighted(clahe_gri, 1.6, bulanik, -0.6, 0)
+    return [gri, clahe_gri, keskin]
+
+
 def ocr_varyantlari(crop_bgr) -> List:
     """
     OCR'a denenecek ön-işleme varyantlarını üretir.
@@ -797,8 +863,13 @@ def ocr_varyantlari(crop_bgr) -> List:
 
     Varyant seti ölçümle seçildi — hepsi aynı hatayı yapmasın diye birbirini
     tamamlayan dönüşümler: ham gri (görüntü iyiyse en sadık), CLAHE (gölge),
-    keskinleştirme (büyütme bulanıklığı) ve daraltılmış bant (fazla tampon
-    alanı OCR'ı yanıltıyorsa).
+    keskinleştirme (büyütme bulanıklığı), daraltılmış bant (fazla tampon
+    alanı OCR'ı yanıltıyorsa) ve eğimi düzeltilmiş hâl (perspektif il kodunu
+    sıkıştırıyorsa).
+
+    ⚠️ SIRALAMA ÖNEMLİ: eğim düzeltilmiş varyantlar EN SONA konuyor. Orijinal
+    zaten temiz okunduysa varyant erken çıkışı devreye girip fazladan iş
+    yapılmıyor; ek maliyet yalnızca ZOR karelerde ödeniyor.
     """
     if crop_bgr is None or crop_bgr.size == 0:
         return []
@@ -806,21 +877,20 @@ def ocr_varyantlari(crop_bgr) -> List:
     if h < 8 or w < 20:
         return []
 
-    gri = _hedef_boyuta_olcekle(crop_bgr)
-
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    clahe_gri = clahe.apply(gri)
-
-    bulanik = cv2.GaussianBlur(clahe_gri, (0, 0), sigmaX=2.0)
-    keskin = cv2.addWeighted(clahe_gri, 1.6, bulanik, -0.6, 0)
-
-    varyantlar = [gri, clahe_gri, keskin]
+    varyantlar = _varyant_seti(crop_bgr, clahe)
 
     # Bant daraltma gerçekten bir şey değiştirdiyse, onun ölçeklenmiş
     # hâlini de ayrı bir varyant olarak dene.
     dar = plaka_bandini_daralt(crop_bgr)
     if dar is not crop_bgr and dar.shape[:2] != crop_bgr.shape[:2]:
         varyantlar.append(_hedef_boyuta_olcekle(dar))
+
+    # 📐 Eğimi düzeltilmiş hâl — perspektifin sıkıştırdığı il kodu için.
+    # En sonda: orijinal temiz okunduysa erken çıkış bunu hiç çalıştırmaz.
+    egimsiz = plaka_egimini_duzelt(crop_bgr)
+    if egimsiz is not None:
+        varyantlar.extend(_varyant_seti(egimsiz, clahe))
 
     return varyantlar
 
